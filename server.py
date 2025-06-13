@@ -35,10 +35,7 @@ MAX_VIDEO_HISTORY = 30  # Number of tokens to include from previous narration (c
 last_narration_per_client = {} # Store last narration per client session
 stream_start_time_per_client = {} # Store stream start time per client
 
-# New: Per-client frame buffers
-client_frame_buffers = {}
-FRAMES_PER_BATCH = 3  # Number of frames to collect before sending to model (tune this)
-PROCESSING_TIMEOUT_SECONDS = 3 # Max time to wait before processing a smaller batch
+# Frame processing is now done one-by-one, no batching.
 
 def decode_image_from_base64(image_b64_string):
     """Decode image from base64 encoded string."""
@@ -58,7 +55,6 @@ def on_connect(auth=None): # Add auth=None to accept optional argument
     print(f"🟢 Client connected: {sid} → initializing session", flush=True)
     
     # Initialize resources for this session
-    client_frame_buffers[sid] = deque()
     last_narration_per_client[sid] = ""
     stream_start_time_per_client[sid] = time.time() # Initialize stream start time
 
@@ -83,8 +79,7 @@ def on_connect(auth=None): # Add auth=None to accept optional argument
 def on_disconnect(auth=None): # Add auth=None to accept optional argument
     sid = request.sid
     print(f"🔴 Client disconnected: {sid} → cleaning up session resources", flush=True)
-    if sid in client_frame_buffers:
-        del client_frame_buffers[sid]
+
     if sid in last_narration_per_client:
         del last_narration_per_client[sid]
     if sid in stream_start_time_per_client:
@@ -92,29 +87,19 @@ def on_disconnect(auth=None): # Add auth=None to accept optional argument
     # Potentially inform the model to clear any session state if necessary,
     # though often this is handled by just not using the session_id anymore.
 
-def process_frame_batch(sid):
-    if sid not in client_frame_buffers or not client_frame_buffers[sid]:
-        return
+def process_single_frame(sid, image):
+    print(f"[{sid}] Processing single frame.", flush=True)
 
-    frames_to_process = list(client_frame_buffers[sid])
-    client_frame_buffers[sid].clear() # Clear buffer for this client
-
-    if not frames_to_process:
-        print(f"[{sid}] No frames to process.", flush=True)
-        return
-
-    print(f"[{sid}] Processing batch of {len(frames_to_process)} frames.", flush=True)
-
-    # Construct prompt for the model
+    # Construct prompt for the model using the most recent narration as context
     last_narration = last_narration_per_client.get(sid, "")
     if last_narration:
-        prompt_text = f"(Previously: {last_narration}) What's happening now?"
+        # Use a more direct continuation prompt
+        prompt_text = f"Continue narrating. The last thing you saw was: '{last_narration}'. What is happening now?"
     else:
         prompt_text = "What's happening now?"
 
     # The model expects a list of images and text in the content
-    # Ensure frames_to_process contains PIL.Image objects
-    model_input_content = frames_to_process + [prompt_text]
+    model_input_content = [image, prompt_text]
 
     model.streaming_prefill(sid, [{
         "role": "user",
@@ -128,13 +113,11 @@ def process_frame_batch(sid):
         images_tensor=None,
         tokenizer=tokenizer,
         max_new_tokens=100,
-        temperature=0.1, # Lower temperature for more factual, less creative narration
-        do_sample=True, # Allow sampling based on temperature
+        temperature=0.1,
+        do_sample=True,
         repetition_penalty=1.0,
         eos_token_id=tokenizer.eos_token_id,
-        generate_audio=False, # Audio generation handled by client or separate TTS
-        # history=last_narration_per_client.get(sid, "") # Pass previous narration as history
-        # max_video_history=MAX_VIDEO_HISTORY # Control history length
+        generate_audio=False
     ):
         token = r.get("text", getattr(r, "text", "")).replace("<|audio_sep|>", "")
         if token.strip():
@@ -142,61 +125,50 @@ def process_frame_batch(sid):
             emit('token', {"text": token}, room=sid)
     
     if current_narration_segment:
-        last_narration_per_client[sid] = (last_narration_per_client.get(sid, "") + " " + current_narration_segment).strip()
+        # Update the last narration with the new segment to maintain context for the next frame
+        last_narration_per_client[sid] = current_narration_segment.strip()
         
-    emit('narration_segment_end', room=sid) # New event to signal end of a narration segment
-    print(f"[{sid}] 📤 Narration segment sent. Total frames processed for this batch: {len(frames_to_process)}", flush=True)
+    emit('narration_segment_end', room=sid)
+    print(f"[{sid}] 📤 Narration segment sent for single frame.", flush=True)
 
 
 @socketio.on('message')
 def handle_message(msg):
     sid = request.sid
     msg_type = msg.get("type", "unknown")
-    print(f"[{sid}] 📥 Received message type={msg_type}", flush=True)
+    # Don't print for every frame to avoid log spam
+    if msg_type != "video_frame":
+        print(f"[{sid}] 📥 Received message type={msg_type}", flush=True)
 
     if msg_type == "init":
         txt = msg.get("text", "")
         print(f"[{sid}] 📝 Instruction: {txt}")
-        # This initial instruction might be for general interaction,
-        # separate from the live narration prompt set in on_connect
         model.streaming_prefill(sid, [{"role":"user","content": txt}], tokenizer)
         emit('ack', {"text": "Instruction received"}, room=sid)
 
     elif msg_type == "video_frame":
-        if sid not in client_frame_buffers:
-            print(f"[{sid}] ⚠️ Received video_frame for unknown session. Ignoring.", flush=True)
-            return
-
         image_b64 = msg.get("image_b64")
         if not image_b64:
-            print(f"[{sid}] ⚠️ video_frame message missing image_b64. Ignoring.", flush=True)
             return
 
         img = decode_image_from_base64(image_b64)
         if img:
-            client_frame_buffers[sid].append(img)
-            # Log frame addition without printing the full base64 string
-            print(f"[{sid}] 🖼️ Frame added to buffer (image data not shown). Buffer size: {len(client_frame_buffers[sid])}", flush=True)
-
-            if len(client_frame_buffers[sid]) >= FRAMES_PER_BATCH:
-                process_frame_batch(sid)
+            # Process frame immediately, no batching
+            process_single_frame(sid, img)
         else:
             print(f"[{sid}] ⚠️ Failed to decode image from video_frame. Ignoring.", flush=True)
-
 
     elif msg_type == "question": # Existing question handling
         question = msg.get("text", "")
         print(f"[{sid}] ❓ Question received: {question}")
-        # Ensure the question is processed in the context of the current session
         model.streaming_prefill(sid, [{"role":"user","content": question}], tokenizer)
         ans_tokens = []
-        # Pass sid as the first argument for session_id, and images=None for text-only questions
         for r in model.streaming_generate(
             sid,
             images=None, 
             tokenizer=tokenizer,
-            temperature=0.1, # Typically lower temp for factual answers
-            do_sample=True, # Allow sampling based on temperature
+            temperature=0.1,
+            do_sample=True,
             generate_audio=False
         ):
             tok = r.get("text", getattr(r, "text", ""))
@@ -207,9 +179,8 @@ def handle_message(msg):
         emit('answer', {"text": answer}, room=sid)
 
     elif msg_type == "end_stream_request": # Client signals end of their video stream
-        print(f"[{sid}] 🔴 Client requested end of stream. Processing any remaining frames.", flush=True)
-        process_frame_batch(sid) # Process any frames left in the buffer
-        # Optionally, emit a final confirmation or perform other cleanup
+        print(f"[{sid}] 🔴 Client requested end of stream.", flush=True)
+        # No frames to process from a buffer, just acknowledge
         emit('stream_ended_ack', room=sid)
 
     else:
@@ -226,4 +197,4 @@ if __name__ == '__main__':
     print("🚀 Starting Flask-SocketIO Omni server on port 8123")
     # Consider using a more production-ready WSGI server like gunicorn for SocketIO
     # e.g., gunicorn --worker-class eventlet -w 1 module:app
-    socketio.run(app, host='0.0.0.0', port=8123, debug=False, use_reloader=False)
+    socketio.run(app, host='0.0.0.0', port=8123, debug=True, use_reloader=False)
