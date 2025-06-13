@@ -37,7 +37,7 @@ stream_start_time_per_client = {} # Store stream start time per client
 
 # New: Per-client frame buffers
 client_frame_buffers = {}
-FRAMES_PER_BATCH = 15  # Number of frames to collect before sending to model (tune this)
+FRAMES_PER_BATCH = 3  # Number of frames to collect before sending to model (tune this)
 PROCESSING_TIMEOUT_SECONDS = 3 # Max time to wait before processing a smaller batch
 
 def decode_image_from_base64(image_b64_string):
@@ -126,7 +126,7 @@ def process_frame_batch(sid):
         tokenizer=tokenizer,
         max_new_tokens=100,
         temperature=0.1, # Lower temperature for more factual, less creative narration
-        do_sample=False, # Added to enable greedy decoding with temp 0.0
+        do_sample=True, # Allow sampling based on temperature
         repetition_penalty=1.0,
         eos_token_id=tokenizer.eos_token_id,
         generate_audio=False, # Audio generation handled by client or separate TTS
@@ -172,7 +172,8 @@ def handle_message(msg):
         img = decode_image_from_base64(image_b64)
         if img:
             client_frame_buffers[sid].append(img)
-            print(f"[{sid}] 🖼️ Frame added to buffer. Buffer size: {len(client_frame_buffers[sid])}", flush=True)
+            # Log frame addition without printing the full base64 string
+            print(f"[{sid}] 🖼️ Frame added to buffer (image data not shown). Buffer size: {len(client_frame_buffers[sid])}", flush=True)
 
             if len(client_frame_buffers[sid]) >= FRAMES_PER_BATCH:
                 process_frame_batch(sid)
@@ -192,7 +193,7 @@ def handle_message(msg):
             images=None, 
             tokenizer=tokenizer,
             temperature=0.1, # Typically lower temp for factual answers
-            do_sample=False, # Added to enable greedy decoding with temp 0.0
+            do_sample=True, # Allow sampling based on temperature
             generate_audio=False
         ):
             tok = r.get("text", getattr(r, "text", ""))
