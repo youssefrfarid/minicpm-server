@@ -65,6 +65,9 @@ MAX_VIDEO_HISTORY = 30  # tokens of history for each client
 last_narration_per_client: Dict[str, str] = {}
 previous_frame_per_client: Dict[str, Optional[Image.Image]] = {}
 
+# Main asyncio event loop (captured on first Socket.IO connection)
+main_loop: Optional[asyncio.AbstractEventLoop] = None
+
 # ─── Helper functions ───────────────────────────────────────────────────
 
 def _decode_image_from_base64(image_b64: str) -> Optional[Image.Image]:
@@ -114,14 +117,18 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
         token = r.get("text", getattr(r, "text", "")).replace("<|audio_sep|>", "")
         if token.strip():
             current_segment += token
-            asyncio.run_coroutine_threadsafe(
-                sio.emit("token", {"text": token}, room=sid), sio.loop
-            )
+            if main_loop is not None:
+                asyncio.run_coroutine_threadsafe(
+                    sio.emit("token", {"text": token}, room=sid), main_loop
+                )
 
     if current_segment:
         last_narration_per_client[sid] = current_segment.strip()
 
-    asyncio.run_coroutine_threadsafe(sio.emit("narration_segment_end", room=sid), sio.loop)
+    if main_loop is not None:
+        asyncio.run_coroutine_threadsafe(
+            sio.emit("narration_segment_end", room=sid), main_loop
+        )
     print(f"[{sid}] 📤 Narration segment sent.")
 
 
@@ -135,6 +142,11 @@ app = FastAPI()
 
 @sio.event
 async def connect(sid, environ, auth):
+    global main_loop
+    # Capture running loop for cross-thread emissions
+    if main_loop is None:
+        main_loop = asyncio.get_running_loop()
+
     print(f"🟢 Client connected: {sid}")
     last_narration_per_client[sid] = ""
     previous_frame_per_client[sid] = None
