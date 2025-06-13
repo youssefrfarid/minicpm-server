@@ -34,6 +34,7 @@ MAX_VIDEO_HISTORY = 30  # Number of tokens to include from previous narration (c
 # frame_timestamps = deque(maxlen=MAX_RECENT_FRAMES) # Replaced by client_frame_buffers
 last_narration_per_client = {} # Store last narration per client session
 stream_start_time_per_client = {} # Store stream start time per client
+previous_frame_per_client = {}  # Store previous frame per client
 
 # Frame processing is now done one-by-one, no batching.
 
@@ -57,6 +58,7 @@ def on_connect(auth=None): # Add auth=None to accept optional argument
     # Initialize resources for this session
     last_narration_per_client[sid] = ""
     stream_start_time_per_client[sid] = time.time() # Initialize stream start time
+    previous_frame_per_client[sid] = None  # No previous frame yet
 
     # Reset model session state for this client. reset_session() clears KV cache for a new logical conversation.
     # The session_id (sid) is then used in subsequent streaming_prefill/generate calls.
@@ -84,22 +86,28 @@ def on_disconnect(auth=None): # Add auth=None to accept optional argument
         del last_narration_per_client[sid]
     if sid in stream_start_time_per_client:
         del stream_start_time_per_client[sid]
+    if sid in previous_frame_per_client:
+        del previous_frame_per_client[sid]
     # Potentially inform the model to clear any session state if necessary,
     # though often this is handled by just not using the session_id anymore.
 
-def process_single_frame(sid, image):
-    print(f"[{sid}] Processing single frame.", flush=True)
+def process_frame(sid, curr_img, prev_img=None):
+    print(f"[{sid}] Processing frame with temporal context.", flush=True)
 
     # Construct prompt for the model using the most recent narration as context
     last_narration = last_narration_per_client.get(sid, "")
     if last_narration:
         # Use a more direct continuation prompt
-        prompt_text = f"Continue narrating. The last thing you saw was: '{last_narration}'. What is happening now?"
+        prompt_text = (
+            f"Continue narrating while ignoring static background details. "
+            f"Previously you said: '{last_narration}'. What is happening now?"
+        )
     else:
-        prompt_text = "What's happening now?"
+        prompt_text = "Focus on the main subjects and their actions. Ignore static background details. What's happening now?"
 
     # The model expects a list of images and text in the content
-    model_input_content = [image, prompt_text]
+    images_list = ([] if prev_img is None else [prev_img]) + [curr_img]
+    model_input_content = images_list + [prompt_text]
 
     model.streaming_prefill(sid, [{
         "role": "user",
@@ -125,7 +133,7 @@ def process_single_frame(sid, image):
             emit('token', {"text": token}, room=sid)
     
     if current_narration_segment:
-        # Update the last narration with the new segment to maintain context for the next frame
+        # Update last narration for context
         last_narration_per_client[sid] = current_narration_segment.strip()
         
     emit('narration_segment_end', room=sid)
@@ -153,8 +161,10 @@ def handle_message(msg):
 
         img = decode_image_from_base64(image_b64)
         if img:
-            # Process frame immediately, no batching
-            process_single_frame(sid, img)
+            # Process current frame with previous frame for temporal context
+            prev_img = previous_frame_per_client.get(sid)
+            process_frame(sid, img, prev_img)
+            previous_frame_per_client[sid] = img
         else:
             print(f"[{sid}] ⚠️ Failed to decode image from video_frame. Ignoring.", flush=True)
 
