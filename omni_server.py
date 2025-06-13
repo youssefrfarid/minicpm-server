@@ -29,6 +29,8 @@ import asyncio
 import base64
 import logging
 import uuid
+import time
+import hashlib
 from collections import deque
 from io import BytesIO
 from typing import Dict, Optional
@@ -234,6 +236,10 @@ async def offer(request: Request):
                 bgr = frame.to_ndarray(format="bgr24")
                 bgr = cv2.resize(bgr, (320, 320), interpolation=cv2.INTER_AREA)
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                # Debug: log timestamp and a quick hash of the frame bytes so we can see uniqueness & timing
+                ts = time.time()
+                frame_hash = hashlib.sha1(bgr.tobytes()[::1000]).hexdigest()[:8]
+                print(f"{ts:.3f} ▶️ frame {frame_hash} queued for processing")
                 pil = Image.fromarray(rgb)
                 emit_sid = latest_socket_sid or peer_id
                 await process_frame(emit_sid, pil, prev_img)
