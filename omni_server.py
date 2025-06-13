@@ -240,3 +240,14 @@ async def offer(request: Request):
 
 # ─── Combine ASGI apps ─────────────────────────────────────────────────
 asgi_app = socketio.ASGIApp(sio, other_asgi_app=app)
+
+if __name__ == "__main__":
+    import argparse
+    import uvicorn
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8123)
+    args = parser.parse_args()
+
+    uvicorn.run(asgi_app, host=args.host, port=args.port, log_level="info")
