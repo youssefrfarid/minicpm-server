@@ -103,7 +103,8 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
         )
 
     # Model expects list[images] + text
-    content = ([] if prev_img is None else [prev_img]) + [curr_img] + [prompt_text]
+    # Provide only the latest frame to reduce repetition
+    content = [curr_img, prompt_text]
     model.streaming_prefill(sid, [{"role": "user", "content": content}], tokenizer)
 
     current_segment = ""
@@ -118,7 +119,12 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
         eos_token_id=tokenizer.eos_token_id,
         generate_audio=False,
     ):
-        token = r.get("text", getattr(r, "text", "")).replace("<|audio_sep|>", "")
+        token = (
+            r.get("text", getattr(r, "text", ""))
+            .replace("<|audio_sep|>", "")
+            .replace("<|tts_eos|>", "")
+            .replace("<|tts|>", "")
+        )
         if token.strip():
             current_segment += token
             if main_loop is not None:
