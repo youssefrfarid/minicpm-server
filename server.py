@@ -125,7 +125,8 @@ def process_frame_batch(sid):
         images_tensor=None,
         tokenizer=tokenizer,
         max_new_tokens=100,
-        temperature=0.0, # Lower temperature for more factual, less creative narration
+        temperature=0.1, # Lower temperature for more factual, less creative narration
+        do_sample=False, # Added to enable greedy decoding with temp 0.0
         repetition_penalty=1.0,
         eos_token_id=tokenizer.eos_token_id,
         generate_audio=False, # Audio generation handled by client or separate TTS
@@ -190,7 +191,8 @@ def handle_message(msg):
             sid,
             images=None, 
             tokenizer=tokenizer,
-            temperature=0.0, # Typically lower temp for factual answers
+            temperature=0.1, # Typically lower temp for factual answers
+            do_sample=False, # Added to enable greedy decoding with temp 0.0
             generate_audio=False
         ):
             tok = r.get("text", getattr(r, "text", ""))
