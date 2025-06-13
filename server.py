@@ -72,7 +72,7 @@ def on_connect(auth=None): # Add auth=None to accept optional argument
         "Start your sentences with phrases like 'You are looking at...' or 'You see...'. "
         "Focus on describing actions, movements, and changes in the scene rather than just listing static objects. "
         "For example, instead of 'There is a cup on the table,' say 'You see a cup sitting on the table.' or if it's moving 'Someone is picking up the cup.' "
-        "Narrate the events as they unfold, token-by-token, to provide a real-time understanding of the environment."
+        "Do not describe the scene just whats happening infront of the user if everything is static say so"
     )
     model.streaming_prefill(sid, [{"role":"user","content": live_instr}], tokenizer)
     print(f"✅ Session initialized for {sid}", flush=True)
