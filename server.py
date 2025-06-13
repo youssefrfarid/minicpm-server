@@ -223,4 +223,4 @@ if __name__ == '__main__':
     print("🚀 Starting Flask-SocketIO Omni server on port 8123")
     # Consider using a more production-ready WSGI server like gunicorn for SocketIO
     # e.g., gunicorn --worker-class eventlet -w 1 module:app
-    socketio.run(app, host='0.0.0.0', port=8123, debug=True, use_reloader=False)
+    socketio.run(app, host='0.0.0.0', port=8123, debug=False, use_reloader=False)
