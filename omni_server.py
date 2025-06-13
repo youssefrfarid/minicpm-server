@@ -31,6 +31,7 @@ import logging
 import uuid
 import time
 import hashlib
+import numpy as np
 from collections import deque
 from io import BytesIO
 from typing import Dict, Optional
@@ -237,15 +238,54 @@ async def offer(request: Request):
         if track.kind == "video":
             print(f"📺 Video track for peer {peer_id}")
             prev_img = None
+            prev_frame_data = None
+            frame_counter = 0
+            duplicate_frames = 0
+            start_time = time.time()
+            
             while True:
                 frame = await track.recv()
                 bgr = frame.to_ndarray(format="bgr24")
                 bgr = cv2.resize(bgr, (320, 320), interpolation=cv2.INTER_AREA)
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                # Debug: log timestamp and a quick hash of the frame bytes so we can see uniqueness & timing
+                
+                # Enhanced frame debugging with sample points and difference detection
+                frame_counter += 1
                 ts = time.time()
-                frame_hash = hashlib.sha1(bgr.tobytes()[::1000]).hexdigest()[:8]
-                print(f"{ts:.3f} ▶️ frame {frame_hash} queued for processing")
+                
+                # Take sample points from frame to create a reliable signature
+                # We sample at multiple points to catch small movements
+                h, w, _ = bgr.shape
+                sample_points = [
+                    bgr[h//4, w//4].mean(),      # top-left quadrant
+                    bgr[h//4, 3*w//4].mean(),   # top-right quadrant
+                    bgr[h//2, w//2].mean(),     # center
+                    bgr[3*h//4, w//4].mean(),   # bottom-left quadrant
+                    bgr[3*h//4, 3*w//4].mean(), # bottom-right quadrant
+                ]
+                
+                # Create hash of sample points
+                frame_hash = hashlib.md5(str(sample_points).encode()).hexdigest()[:8]
+                
+                # Calculate frame difference if we have a previous frame
+                is_duplicate = False
+                if prev_frame_data is not None:
+                    # Calculate Mean Squared Error between frames
+                    mse = np.mean((bgr.astype("float") - prev_frame_data.astype("float")) ** 2)
+                    is_duplicate = mse < 10.0  # Threshold for considering frames as duplicates
+                    if is_duplicate:
+                        duplicate_frames += 1
+                
+                # Log detailed frame info
+                elapsed = ts - start_time
+                fps = frame_counter / elapsed if elapsed > 0 else 0
+                dup_percent = (duplicate_frames / frame_counter * 100) if frame_counter > 0 else 0
+                print(f"{ts:.3f} ▶️ Frame #{frame_counter} hash={frame_hash} {'🔄 DUPLICATE' if is_duplicate else '✅ UNIQUE'} "
+                      f"[{duplicate_frames}/{frame_counter} dupes={dup_percent:.1f}% fps={fps:.1f}]")
+                
+                # Save current frame for next comparison
+                prev_frame_data = bgr.copy()
+                
                 pil = Image.fromarray(rgb)
                 emit_sid = latest_socket_sid or peer_id
                 await process_frame(emit_sid, pil, prev_img)
