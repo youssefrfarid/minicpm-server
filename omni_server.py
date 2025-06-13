@@ -67,6 +67,8 @@ previous_frame_per_client: Dict[str, Optional[Image.Image]] = {}
 
 # Main asyncio event loop (captured on first Socket.IO connection)
 main_loop: Optional[asyncio.AbstractEventLoop] = None
+# Latest connected Socket.IO sid (single-client assumption)
+latest_socket_sid: Optional[str] = None
 
 # ─── Helper functions ───────────────────────────────────────────────────
 
@@ -142,12 +144,14 @@ app = FastAPI()
 
 @sio.event
 async def connect(sid, environ, auth):
+    global latest_socket_sid
     global main_loop
     # Capture running loop for cross-thread emissions
     if main_loop is None:
         main_loop = asyncio.get_running_loop()
 
     print(f"🟢 Client connected: {sid}")
+    latest_socket_sid = sid
     last_narration_per_client[sid] = ""
     previous_frame_per_client[sid] = None
 
@@ -231,7 +235,8 @@ async def offer(request: Request):
                 bgr = cv2.resize(bgr, (320, 320), interpolation=cv2.INTER_AREA)
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                 pil = Image.fromarray(rgb)
-                await process_frame(peer_id, pil, prev_img)
+                emit_sid = latest_socket_sid or peer_id
+                await process_frame(emit_sid, pil, prev_img)
                 prev_img = pil
         elif track.kind == "audio":
             await recorder.start()
