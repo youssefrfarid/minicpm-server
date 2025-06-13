@@ -70,9 +70,11 @@ def on_connect(auth=None): # Add auth=None to accept optional argument
     model.streaming_prefill(sid, [sys_msg], tokenizer)
     
     live_instr = (
-        "You are a live video narrator for a visually impaired user. "
-        "Describe the sequence of events in these frames concisely and in the present tense. "
-        "Focus on important actions and changes. Emit descriptions token-by-token."
+        "You are a live video narrator for a visually impaired user, acting as their eyes. Your descriptions should be immediate, concise, and in the present tense. "
+        "Start your sentences with phrases like 'You are looking at...' or 'You see...'. "
+        "Focus on describing actions, movements, and changes in the scene rather than just listing static objects. "
+        "For example, instead of 'There is a cup on the table,' say 'You see a cup sitting on the table.' or if it's moving 'Someone is picking up the cup.' "
+        "Narrate the events as they unfold, token-by-token, to provide a real-time understanding of the environment."
     )
     model.streaming_prefill(sid, [{"role":"user","content": live_instr}], tokenizer)
     print(f"✅ Session initialized for {sid}", flush=True)
@@ -104,10 +106,11 @@ def process_frame_batch(sid):
     print(f"[{sid}] Processing batch of {len(frames_to_process)} frames.", flush=True)
 
     # Construct prompt for the model
-    # context_prompt = f"Continue narrating. Previously: '{last_narration_per_client.get(sid, '')[-MAX_VIDEO_HISTORY:]}'" \
-    #                  if last_narration_per_client.get(sid) else "Describe this video sequence."
-    # For simplicity, let's start with a more direct prompt for the sequence
-    prompt_text = "Describe this sequence of visual events for a visually impaired person."
+    last_narration = last_narration_per_client.get(sid, "")
+    if last_narration:
+        prompt_text = f"(Previously: {last_narration}) What's happening now?"
+    else:
+        prompt_text = "What's happening now?"
 
     # The model expects a list of images and text in the content
     # Ensure frames_to_process contains PIL.Image objects
