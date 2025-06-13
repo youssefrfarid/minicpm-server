@@ -1,5 +1,5 @@
 import logging
-from flask import Flask
+from flask import Flask, request
 from flask_socketio import SocketIO, emit
 import base64, numpy as np
 from io import BytesIO
