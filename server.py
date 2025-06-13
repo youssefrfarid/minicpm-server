@@ -53,7 +53,7 @@ def decode_image_from_base64(image_b64_string):
 
 # ─── WebSocket handlers ───────────────────────────────────────
 @socketio.on('connect')
-def on_connect():
+def on_connect(auth=None): # Add auth=None to accept optional argument
     sid = request.sid
     print(f"🟢 Client connected: {sid} → initializing session", flush=True)
     
@@ -62,10 +62,9 @@ def on_connect():
     last_narration_per_client[sid] = ""
     stream_start_time_per_client[sid] = time.time() # Initialize stream start time
 
-    # Reset model session state for this client if model supports per-session state
-    # The MiniCPM model's chat/streaming_prefill/streaming_generate methods
-    # usually take a session_id argument. We'll use the client's sid.
-    model.reset_session(session_id=sid) # Assuming model has such a method or handles session_id in calls
+    # Reset model session state for this client. reset_session() clears KV cache for a new logical conversation.
+    # The session_id (sid) is then used in subsequent streaming_prefill/generate calls.
+    model.reset_session()
 
     sys_msg = model.get_sys_prompt(mode='omni', language='en')
     model.streaming_prefill(sid, [sys_msg], tokenizer)
@@ -79,7 +78,7 @@ def on_connect():
     print(f"✅ Session initialized for {sid}", flush=True)
 
 @socketio.on('disconnect')
-def on_disconnect():
+def on_disconnect(auth=None): # Add auth=None to accept optional argument
     sid = request.sid
     print(f"🔴 Client disconnected: {sid} → cleaning up session resources", flush=True)
     if sid in client_frame_buffers:
@@ -120,19 +119,23 @@ def process_frame_batch(sid):
     }], tokenizer)
 
     current_narration_segment = ""
+    # Pass sid as the first argument for session_id
     for r in model.streaming_generate(
-        session_id=sid,
+        sid, 
+        images_tensor=None,
         tokenizer=tokenizer,
-        temperature=0.5, # Adjust as needed
-        generate_audio=False # We are not using the model's TTS
+        max_new_tokens=100,
+        temperature=0.0, # Lower temperature for more factual, less creative narration
+        repetition_penalty=1.0,
+        eos_token_id=tokenizer.eos_token_id,
+        generate_audio=False, # Audio generation handled by client or separate TTS
+        # history=last_narration_per_client.get(sid, "") # Pass previous narration as history
+        # max_video_history=MAX_VIDEO_HISTORY # Control history length
     ):
-        token = r.get("text", getattr(r, "text", ""))
-        if token:
-            # Filter out TTS markers if any (though init_tts=False should prevent them)
-            token = token.replace("<|tts_eos|>", "").replace("<|audio_sep|>", "")
-            if token.strip():
-                current_narration_segment += token
-                emit('token', {"text": token}, room=sid)
+        token = r.get("text", getattr(r, "text", "")).replace("<|audio_sep|>", "")
+        if token.strip():
+            current_narration_segment += token
+            emit('token', {"text": token}, room=sid)
     
     if current_narration_segment:
         last_narration_per_client[sid] = (last_narration_per_client.get(sid, "") + " " + current_narration_segment).strip()
@@ -182,8 +185,10 @@ def handle_message(msg):
         # Ensure the question is processed in the context of the current session
         model.streaming_prefill(sid, [{"role":"user","content": question}], tokenizer)
         ans_tokens = []
+        # Pass sid as the first argument for session_id, and images=None for text-only questions
         for r in model.streaming_generate(
-            session_id=sid,
+            sid,
+            images=None, 
             tokenizer=tokenizer,
             temperature=0.0, # Typically lower temp for factual answers
             generate_audio=False
