@@ -72,7 +72,7 @@ def on_connect(auth=None): # Add auth=None to accept optional argument
         "Start your sentences with phrases like 'You are looking at...' or 'You see...'. "
         "Focus on describing actions, movements, and changes in the scene rather than just listing static objects. "
         "For example, instead of 'There is a cup on the table,' say 'You see a cup sitting on the table.' or if it's moving 'Someone is picking up the cup.' "
-        "Do not describe the scene just whats happening infront of the user if everything is static say so"
+        "Narrate the events as they unfold, token-by-token, to provide a real-time understanding of the environment."
     )
     model.streaming_prefill(sid, [{"role":"user","content": live_instr}], tokenizer)
     print(f"✅ Session initialized for {sid}", flush=True)
@@ -90,6 +90,13 @@ def on_disconnect(auth=None): # Add auth=None to accept optional argument
         del previous_frame_per_client[sid]
     # Potentially inform the model to clear any session state if necessary,
     # though often this is handled by just not using the session_id anymore.
+
+@socketio.on('keepalive')
+def handle_keepalive(data):
+    """Handle keepalive pings from clients to prevent socket timeouts"""
+    sid = request.sid
+    socketio.emit('keepalive_ack', {'timestamp': data.get('timestamp')}, room=sid)
+    # Uncomment for debugging: print(f"♥️ Keepalive from client {sid}", flush=True)
 
 def process_frame(sid, curr_img, prev_img=None):
     print(f"[{sid}] Processing frame with temporal context.", flush=True)
