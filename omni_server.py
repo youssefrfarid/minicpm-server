@@ -125,36 +125,77 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
             "background details. What's happening now?"
         )
 
-    # Model expects list[images] + text
-    # Provide only the latest frame to reduce repetition
-    content = [curr_img, prompt_text]
-    model.streaming_prefill(sid, [{"role": "user", "content": content}], tokenizer)
-
-    current_segment = ""
-    for r in model.streaming_generate(
-        sid,
-        images_tensor=None,
-        tokenizer=tokenizer,
-        max_new_tokens=100,
-        temperature=0.1,
-        do_sample=True,
-        repetition_penalty=1.0,
-        eos_token_id=tokenizer.eos_token_id,
-        generate_audio=False,
-    ):
-        token = (
-            r.get("text", getattr(r, "text", ""))
-            .replace("<|audio_sep|>", "")
-            .replace("<|tts_eos|>", "")
-            .replace("<|tts|>", "")
+    # Use official MiniCPM-o-2.6 API format
+    msgs = [{'role': 'user', 'content': [curr_img, prompt_text]}]
+    
+    try:
+        # Use official chat method with streaming (if available) or full response
+        response = model.chat(
+            msgs=msgs,
+            tokenizer=tokenizer,
+            max_new_tokens=100,
+            temperature=0.1,
+            do_sample=True
         )
-        if token.strip():
-            current_segment += token
-
-    if current_segment:
-        last_narration_per_client[sid] = current_segment.strip()
-
-    return current_segment
+        
+        # Clean up response tokens
+        if response:
+            cleaned_response = (
+                response.replace("<|audio_sep|>", "")
+                .replace("<|tts_eos|>", "")
+                .replace("<|tts|>", "")
+                .strip()
+            )
+            
+            if cleaned_response:
+                last_narration_per_client[sid] = cleaned_response
+                
+                # Get the data channel for narration output  
+                narration_channel = data_channels.get('narration')
+                
+                # Send the complete response as narration tokens
+                # For real-time feel, split into words and send progressively
+                words = cleaned_response.split()
+                for i, word in enumerate(words):
+                    message = {
+                        "type": "narration",
+                        "token": word + (" " if i < len(words) - 1 else ""),
+                        "is_final": i == len(words) - 1
+                    }
+                    
+                    # Send through data channel if available
+                    if narration_channel:
+                        try:
+                            narration_channel.send(json.dumps(message))
+                            time.sleep(0.05)  # Small delay for streaming effect
+                        except Exception as e:
+                            print(f"Error sending via data channel: {e}")
+                            break
+                
+                # Send final completion message
+                if narration_channel:
+                    try:
+                        completion_message = {
+                            "type": "narration_complete",
+                            "full_text": cleaned_response
+                        }
+                        narration_channel.send(json.dumps(completion_message))
+                    except Exception as e:
+                        print(f"Error sending completion via data channel: {e}")
+        
+    except Exception as e:
+        print(f"Error in MiniCPM-o inference: {e}")
+        # Send error message via data channel
+        narration_channel = data_channels.get('narration')
+        if narration_channel:
+            try:
+                error_message = {
+                    "type": "error",
+                    "message": f"Inference error: {str(e)}"
+                }
+                narration_channel.send(json.dumps(error_message))
+            except Exception as send_e:
+                print(f"Error sending error message: {send_e}")
 
 
 async def process_frame(sid: str, curr_img: Image.Image, prev_img: Optional[Image.Image]):
