@@ -66,21 +66,23 @@ print("✅ Model loaded", flush=True)
 
 # ─── Global state management ───────────────────────────────────────────────
 
-# Track peer connections
+# Global stores for peer connections and data channels
 pcs: Dict[str, RTCPeerConnection] = {}
-last_narration_per_client: Dict[str, str] = {}
-
-# Global data channels storage (keyed by peer_id then channel_label)
 global_data_channels: Dict[str, Dict[str, RTCDataChannel]] = {}
+last_narration_per_client: Dict[str, str] = {}
+previous_frame_per_client: Dict[str, Optional[Image.Image]] = {}
+
+# Authentication store
+auth_tokens = set()
 
 # ─── Shared session state ───────────────────────────────────────────────
 MAX_VIDEO_HISTORY = 30  # tokens of history for each client
-previous_frame_per_client: Dict[str, Optional[Image.Image]] = {}
-
-# Frame memory for incoming frames from Flutter client
-frame_memory: Dict[str, Image.Image] = {}
 
 # ─── Helper functions ───────────────────────────────────────────────────
+
+def get_peer_id_from_channel(channel: RTCDataChannel) -> str:
+    """Extract peer ID from data channel."""
+    return f"peer_{id(channel)}"
 
 def _decode_image_from_base64(image_b64: str) -> Optional[Image.Image]:
     try:
@@ -318,97 +320,43 @@ app = FastAPI()
 
 # Data channel message handler
 async def on_message(channel: RTCDataChannel, message: str):
-    """Handle incoming messages from Flutter client via WebRTC data channel."""
+    """Handle incoming WebRTC data channel messages."""
     try:
         data = json.loads(message)
-        msg_type = data.get('type', 'unknown')
+        msg_type = data.get('type')
         
-        print(f"📨 [DEBUG] Received message type: {msg_type}")
+        print(f"📨 [DEBUG] Received message: {msg_type}")
         
-        if msg_type == 'frame':
-            # Handle incoming frame from Flutter client
-            await handle_frame_message(channel, data)
-        elif msg_type == 'start_narration':
-            # Handle start narration request
+        if msg_type == 'start_narration':
+            # Handle narration start request
             await handle_start_narration(channel, data)
         elif msg_type == 'end_stream':
-            # Handle end stream request
+            # Handle stream end request
             await handle_end_stream(channel, data)
         elif msg_type == 'question':
-            # Handle question request
+            # Handle user questions
             await handle_question(channel, data)
         else:
             print(f"⚠️ [DEBUG] Unknown message type: {msg_type}")
             
-    except json.JSONDecodeError as e:
-        print(f"❌ [DEBUG] Error parsing JSON message: {e}")
-        print(f"❌ [DEBUG] Raw message: {message[:100]}...")
     except Exception as e:
-        print(f"❌ [DEBUG] Error handling message: {e}")
-        import traceback
-        traceback.print_exc()
-
-
-async def handle_frame_message(channel: RTCDataChannel, data: Dict[str, Any]):
-    """Handle incoming frame data from Flutter client."""
-    try:
-        # Get peer ID from channel
-        peer_id = f"peer_{id(channel)}"
-        
-        # Extract base64 image data
-        base64_image = data.get('image', '')
-        timestamp = data.get('timestamp', 0)
-        
-        if not base64_image:
-            print(f"⚠️ [DEBUG] Received frame message without image data")
-            return
-        
-        print(f"🖼️ [DEBUG] Processing frame from {peer_id} (timestamp: {timestamp})")
-        
-        # Decode base64 image
-        try:
-            image_data = base64.b64decode(base64_image)
-            image = Image.open(BytesIO(image_data))
-            print(f"🖼️ [DEBUG] Decoded image: {image.size} - {image.mode}")
-            
-            # Convert to RGB if needed
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
-            
-            # Get previous frame for comparison
-            prev_image = frame_memory.get(peer_id)
-            
-            # Store current frame as previous for next iteration
-            frame_memory[peer_id] = image
-            
-            # Process the frame
-            await process_frame(peer_id, image, prev_image)
-            
-        except Exception as decode_error:
-            print(f"❌ [DEBUG] Error decoding image: {decode_error}")
-            
-    except Exception as e:
-        print(f"❌ [DEBUG] Error in handle_frame_message: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"❌ [DEBUG] Error in on_message: {e}")
 
 
 async def handle_start_narration(channel: RTCDataChannel, data: Dict[str, Any]):
     """Handle start narration request."""
     try:
-        peer_id = f"peer_{id(channel)}"
+        peer_id = get_peer_id_from_channel(channel)
         client_id = data.get('client_id', 'unknown')
         
-        print(f"🎬 [DEBUG] Start narration request from {peer_id} (client: {client_id})")
+        print(f"🎬 [DEBUG] Starting narration for peer {peer_id}, client {client_id}")
         
         # Send acknowledgment
-        ack_message = {
-            "type": "start_narration_ack",
-            "status": "ready",
-            "message": "Server ready for frame processing"
+        response = {
+            "type": "ack",
+            "message": "Server ready for video processing"
         }
-        channel.send(json.dumps(ack_message))
-        print(f"✅ [DEBUG] Sent start narration acknowledgment to {peer_id}")
+        channel.send(json.dumps(response))
         
     except Exception as e:
         print(f"❌ [DEBUG] Error in handle_start_narration: {e}")
@@ -417,43 +365,41 @@ async def handle_start_narration(channel: RTCDataChannel, data: Dict[str, Any]):
 async def handle_end_stream(channel: RTCDataChannel, data: Dict[str, Any]):
     """Handle end stream request."""
     try:
-        peer_id = f"peer_{id(channel)}"
-        print(f"🛑 [DEBUG] End stream request from {peer_id}")
+        peer_id = get_peer_id_from_channel(channel)
         
-        # Clean up peer data
-        if peer_id in frame_memory:
-            del frame_memory[peer_id]
+        print(f"🛑 [DEBUG] Ending stream for peer {peer_id}")
+        
+        # Clean up any peer-specific data
+        if peer_id in previous_frame_per_client:
+            del previous_frame_per_client[peer_id]
         if peer_id in last_narration_per_client:
             del last_narration_per_client[peer_id]
         
         # Send acknowledgment
-        ack_message = {
-            "type": "end_stream_ack",
-            "status": "stopped"
+        response = {
+            "type": "ack", 
+            "message": "Stream ended successfully"
         }
-        channel.send(json.dumps(ack_message))
-        print(f"✅ [DEBUG] Processed end stream for {peer_id}")
+        channel.send(json.dumps(response))
         
     except Exception as e:
         print(f"❌ [DEBUG] Error in handle_end_stream: {e}")
 
 
 async def handle_question(channel: RTCDataChannel, data: Dict[str, Any]):
-    """Handle question request."""
+    """Handle user questions about the current scene."""
     try:
-        peer_id = f"peer_{id(channel)}"
-        question = data.get('text', '')
+        peer_id = get_peer_id_from_channel(channel)
+        question = data.get('question', '')
         
-        print(f"❓ [DEBUG] Question from {peer_id}: {question}")
+        print(f"❓ [DEBUG] Question from peer {peer_id}: {question}")
         
-        # For now, just acknowledge the question
-        # TODO: Implement question processing with current frame
-        ack_message = {
-            "type": "question_ack",
-            "status": "received",
-            "question": question
+        # TODO: Implement question processing with current video frame
+        response = {
+            "type": "ack",
+            "message": f"Question received: {question}"
         }
-        channel.send(json.dumps(ack_message))
+        channel.send(json.dumps(response))
         
     except Exception as e:
         print(f"❌ [DEBUG] Error in handle_question: {e}")
