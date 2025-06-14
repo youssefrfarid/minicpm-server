@@ -191,10 +191,10 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
             # Attempt to use streaming methods (if available)
             response_stream = model.streaming_generate(
                 msgs=msgs,
-                tokenizer=tokenizer,
+                session_id=sid,
                 max_new_tokens=100,
-                temperature=0.1,
-                do_sample=True
+                temperature=0.2,
+                repetition_penalty=1.05
             )
             
             print(f"🔄 [DEBUG] Using streaming_generate for real-time tokens")
@@ -245,9 +245,9 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
             # Fallback to regular chat method
             response = model.chat(
                 msgs=msgs,
-                tokenizer=tokenizer,
+                session_id=sid,
                 max_new_tokens=100,
-                temperature=0.1,
+                temperature=0.2,
                 do_sample=True
             )
             
