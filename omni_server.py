@@ -77,6 +77,9 @@ global_data_channels: Dict[str, Dict[str, RTCDataChannel]] = {}
 MAX_VIDEO_HISTORY = 30  # tokens of history for each client
 previous_frame_per_client: Dict[str, Optional[Image.Image]] = {}
 
+# Frame memory for incoming frames from Flutter client
+frame_memory: Dict[str, Image.Image] = {}
+
 # ─── Helper functions ───────────────────────────────────────────────────
 
 def _decode_image_from_base64(image_b64: str) -> Optional[Image.Image]:
@@ -117,10 +120,18 @@ def _compute_frame_similarity(img1: Image.Image, img2: Image.Image) -> float:
 
 
 def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Image.Image]):
-    """Blocking call that interacts with MiniCPM-o and returns the response."""
+    """Blocking call that interacts with MiniCPM-o and returns streaming tokens."""
     print(f"🔄 [DEBUG] Starting inference for peer {sid}")
     print(f"🔄 [DEBUG] Current image size: {curr_img.size}")
     print(f"🔄 [DEBUG] Previous image: {'Available' if prev_img else 'None'}")
+    
+    # Skip processing if frames are too similar (static scene)
+    if prev_img is not None:
+        similarity = _compute_frame_similarity(curr_img, prev_img)
+        print(f"🔄 [DEBUG] Frame similarity: {similarity:.3f}")
+        if similarity > 0.95:  # 95% similar = skip processing
+            print(f"⏭️ [DEBUG] Frames too similar ({similarity:.3f}), skipping inference")
+            return None
     
     last_narr = last_narration_per_client.get(sid, "")
     
@@ -162,40 +173,113 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
         msgs[1]['content'].insert(-1, prev_img)  # Add prev_img before prompt_text
         print(f"🔄 [DEBUG] Added previous frame to message")
     
-    print(f"🔄 [DEBUG] Calling model.chat with {len(msgs)} messages...")
+    print(f"🔄 [DEBUG] Calling model streaming with {len(msgs)} messages...")
     
     try:
-        # Use official chat method
-        response = model.chat(
-            msgs=msgs,
-            tokenizer=tokenizer,
-            max_new_tokens=100,
-            temperature=0.1,
-            do_sample=True
-        )
+        # Get the data channel for narration output from global storage
+        peer_channels = global_data_channels.get(sid, {})
+        narration_channel = peer_channels.get('narration')
         
-        print(f"🔄 [DEBUG] Raw model response: '{response}'")
-        print(f"🔄 [DEBUG] Response type: {type(response)}")
+        if not narration_channel:
+            print(f"⚠️ [DEBUG] No narration channel found for peer {sid}")
+            return None
         
-        # Clean up response tokens
-        if response:
-            cleaned_response = (
-                response.replace("<|audio_sep|>", "")
-                .replace("<|tts_eos|>", "")
-                .replace("<|tts|>", "")
-                .strip()
+        # Try to use streaming if available, otherwise fall back to chat
+        try:
+            # Attempt to use streaming methods (if available)
+            response_stream = model.streaming_generate(
+                msgs=msgs,
+                tokenizer=tokenizer,
+                max_new_tokens=100,
+                temperature=0.1,
+                do_sample=True
             )
             
-            print(f"🔄 [DEBUG] Cleaned response: '{cleaned_response}'")
+            print(f"🔄 [DEBUG] Using streaming_generate for real-time tokens")
+            full_response = ""
             
-            if cleaned_response:
-                last_narration_per_client[sid] = cleaned_response
-                print(f"✅ [DEBUG] Inference successful, returning: '{cleaned_response}'")
-                return cleaned_response  # Return result instead of sending via data channel
-            else:
-                print(f"⚠️ [DEBUG] Cleaned response is empty")
-        else:
-            print(f"⚠️ [DEBUG] Model returned None/empty response")
+            # Stream tokens as they're generated
+            for token_data in response_stream:
+                if isinstance(token_data, dict) and 'token' in token_data:
+                    token = token_data['token']
+                elif isinstance(token_data, str):
+                    token = token_data
+                else:
+                    continue
+                
+                # Clean token
+                cleaned_token = (
+                    token.replace("<|audio_sep|>", "")
+                    .replace("<|tts_eos|>", "")
+                    .replace("<|tts|>", "")
+                )
+                
+                if cleaned_token.strip():
+                    full_response += cleaned_token
+                    
+                    # Send token immediately
+                    message = {
+                        "type": "narration",
+                        "token": cleaned_token,
+                        "is_final": False
+                    }
+                    narration_channel.send(json.dumps(message))
+                    print(f"🔄 [DEBUG] Streamed token: '{cleaned_token}'")
+            
+            # Send completion
+            if full_response.strip():
+                completion_message = {
+                    "type": "narration_complete",
+                    "full_text": full_response.strip()
+                }
+                narration_channel.send(json.dumps(completion_message))
+                last_narration_per_client[sid] = full_response.strip()
+                print(f"✅ [DEBUG] Streaming complete: '{full_response.strip()}'")
+                return full_response.strip()
+            
+        except (AttributeError, TypeError) as streaming_error:
+            print(f"⚠️ [DEBUG] Streaming not available ({streaming_error}), falling back to chat")
+            
+            # Fallback to regular chat method
+            response = model.chat(
+                msgs=msgs,
+                tokenizer=tokenizer,
+                max_new_tokens=100,
+                temperature=0.1,
+                do_sample=True
+            )
+            
+            print(f"🔄 [DEBUG] Raw model response: '{response}'")
+            
+            # Clean up response tokens
+            if response:
+                cleaned_response = (
+                    response.replace("<|audio_sep|>", "")
+                    .replace("<|tts_eos|>", "")
+                    .replace("<|tts|>", "")
+                    .strip()
+                )
+                
+                print(f"🔄 [DEBUG] Cleaned response: '{cleaned_response}'")
+                
+                if cleaned_response:
+                    # Send complete response immediately (not word by word)
+                    message = {
+                        "type": "narration",
+                        "token": cleaned_response,
+                        "is_final": True
+                    }
+                    narration_channel.send(json.dumps(message))
+                    
+                    completion_message = {
+                        "type": "narration_complete",
+                        "full_text": cleaned_response
+                    }
+                    narration_channel.send(json.dumps(completion_message))
+                    
+                    last_narration_per_client[sid] = cleaned_response
+                    print(f"✅ [DEBUG] Sent complete response: '{cleaned_response}'")
+                    return cleaned_response
         
         return None
         
@@ -204,75 +288,176 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
         print(f"❌ [DEBUG] Exception type: {type(e)}")
         import traceback
         traceback.print_exc()
+        
+        # Send error via data channel
+        peer_channels = global_data_channels.get(sid, {})
+        narration_channel = peer_channels.get('narration')
+        if narration_channel:
+            error_message = {
+                "type": "error",
+                "message": f"Inference error: {str(e)}"
+            }
+            narration_channel.send(json.dumps(error_message))
+        
         return f"ERROR: {str(e)}"
 
 
 async def process_frame(sid: str, curr_img: Image.Image, prev_img: Optional[Image.Image]):
-    """Process frame and send results via data channel in main loop."""
+    """Process frame and handle streaming in thread pool."""
     print(f"🎬 [DEBUG] process_frame called for peer {sid}")
     
-    # Run model inference in thread pool
-    print(f"🎬 [DEBUG] Starting inference in thread pool...")
+    # Run streaming inference in thread pool (data channel sends happen inside)
+    print(f"🎬 [DEBUG] Starting streaming inference in thread pool...")
     result = await asyncio.to_thread(_process_frame_sync, sid, curr_img, prev_img)
-    print(f"🎬 [DEBUG] Inference completed, result: '{result}'")
-    
-    if result:
-        # Get the data channel for narration output from main loop
-        peer_channels = global_data_channels.get(sid, {})
-        narration_channel = peer_channels.get('narration')
-        
-        print(f"🎬 [DEBUG] Data channel available: {narration_channel is not None}")
-        
-        if result.startswith("ERROR:"):
-            # Send error message
-            if narration_channel:
-                try:
-                    error_message = {
-                        "type": "error", 
-                        "message": result
-                    }
-                    narration_channel.send(json.dumps(error_message))
-                    print(f"❌ [DEBUG] Sent error message via data channel")
-                except Exception as e:
-                    print(f"❌ [DEBUG] Error sending error via data channel: {e}")
-        else:
-            # Send successful narration result
-            if narration_channel:
-                try:
-                    # Send the complete response as narration tokens
-                    # For real-time feel, split into words and send progressively
-                    words = result.split()
-                    print(f"🎬 [DEBUG] Sending {len(words)} words via data channel...")
-                    
-                    for i, word in enumerate(words):
-                        message = {
-                            "type": "narration",
-                            "token": word + (" " if i < len(words) - 1 else ""),
-                            "is_final": i == len(words) - 1
-                        }
-                        narration_channel.send(json.dumps(message))
-                        print(f"🎬 [DEBUG] Sent word {i+1}/{len(words)}: '{word}'")
-                        await asyncio.sleep(0.05)  # Small delay for streaming effect
-                    
-                    # Send final completion message
-                    completion_message = {
-                        "type": "narration_complete",
-                        "full_text": result
-                    }
-                    narration_channel.send(json.dumps(completion_message))
-                    print(f"🎬 [DEBUG] Sent completion message")
-                    
-                except Exception as e:
-                    print(f"❌ [DEBUG] Error sending narration via data channel: {e}")
-            else:
-                print(f"⚠️ [DEBUG] No narration channel found for peer {sid}")
-    else:
-        print(f"⚠️ [DEBUG] No result to send for peer {sid}")
+    print(f"🎬 [DEBUG] Streaming inference completed, result: {'Success' if result else 'Skipped/None'}")
     
     return result
 
 # ─── WebRTC signalling & media ingestion ───────────────────────────────
 app = FastAPI()
+
+# Data channel message handler
+async def on_message(channel: RTCDataChannel, message: str):
+    """Handle incoming messages from Flutter client via WebRTC data channel."""
+    try:
+        data = json.loads(message)
+        msg_type = data.get('type', 'unknown')
+        
+        print(f"📨 [DEBUG] Received message type: {msg_type}")
+        
+        if msg_type == 'frame':
+            # Handle incoming frame from Flutter client
+            await handle_frame_message(channel, data)
+        elif msg_type == 'start_narration':
+            # Handle start narration request
+            await handle_start_narration(channel, data)
+        elif msg_type == 'end_stream':
+            # Handle end stream request
+            await handle_end_stream(channel, data)
+        elif msg_type == 'question':
+            # Handle question request
+            await handle_question(channel, data)
+        else:
+            print(f"⚠️ [DEBUG] Unknown message type: {msg_type}")
+            
+    except json.JSONDecodeError as e:
+        print(f"❌ [DEBUG] Error parsing JSON message: {e}")
+        print(f"❌ [DEBUG] Raw message: {message[:100]}...")
+    except Exception as e:
+        print(f"❌ [DEBUG] Error handling message: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+async def handle_frame_message(channel: RTCDataChannel, data: Dict[str, Any]):
+    """Handle incoming frame data from Flutter client."""
+    try:
+        # Get peer ID from channel
+        peer_id = f"peer_{id(channel)}"
+        
+        # Extract base64 image data
+        base64_image = data.get('image', '')
+        timestamp = data.get('timestamp', 0)
+        
+        if not base64_image:
+            print(f"⚠️ [DEBUG] Received frame message without image data")
+            return
+        
+        print(f"🖼️ [DEBUG] Processing frame from {peer_id} (timestamp: {timestamp})")
+        
+        # Decode base64 image
+        try:
+            image_data = base64.b64decode(base64_image)
+            image = Image.open(BytesIO(image_data))
+            print(f"🖼️ [DEBUG] Decoded image: {image.size} - {image.mode}")
+            
+            # Convert to RGB if needed
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            
+            # Get previous frame for comparison
+            prev_image = frame_memory.get(peer_id)
+            
+            # Store current frame as previous for next iteration
+            frame_memory[peer_id] = image
+            
+            # Process the frame
+            await process_frame(peer_id, image, prev_image)
+            
+        except Exception as decode_error:
+            print(f"❌ [DEBUG] Error decoding image: {decode_error}")
+            
+    except Exception as e:
+        print(f"❌ [DEBUG] Error in handle_frame_message: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+async def handle_start_narration(channel: RTCDataChannel, data: Dict[str, Any]):
+    """Handle start narration request."""
+    try:
+        peer_id = f"peer_{id(channel)}"
+        client_id = data.get('client_id', 'unknown')
+        
+        print(f"🎬 [DEBUG] Start narration request from {peer_id} (client: {client_id})")
+        
+        # Send acknowledgment
+        ack_message = {
+            "type": "start_narration_ack",
+            "status": "ready",
+            "message": "Server ready for frame processing"
+        }
+        channel.send(json.dumps(ack_message))
+        print(f"✅ [DEBUG] Sent start narration acknowledgment to {peer_id}")
+        
+    except Exception as e:
+        print(f"❌ [DEBUG] Error in handle_start_narration: {e}")
+
+
+async def handle_end_stream(channel: RTCDataChannel, data: Dict[str, Any]):
+    """Handle end stream request."""
+    try:
+        peer_id = f"peer_{id(channel)}"
+        print(f"🛑 [DEBUG] End stream request from {peer_id}")
+        
+        # Clean up peer data
+        if peer_id in frame_memory:
+            del frame_memory[peer_id]
+        if peer_id in last_narration_per_client:
+            del last_narration_per_client[peer_id]
+        
+        # Send acknowledgment
+        ack_message = {
+            "type": "end_stream_ack",
+            "status": "stopped"
+        }
+        channel.send(json.dumps(ack_message))
+        print(f"✅ [DEBUG] Processed end stream for {peer_id}")
+        
+    except Exception as e:
+        print(f"❌ [DEBUG] Error in handle_end_stream: {e}")
+
+
+async def handle_question(channel: RTCDataChannel, data: Dict[str, Any]):
+    """Handle question request."""
+    try:
+        peer_id = f"peer_{id(channel)}"
+        question = data.get('text', '')
+        
+        print(f"❓ [DEBUG] Question from {peer_id}: {question}")
+        
+        # For now, just acknowledge the question
+        # TODO: Implement question processing with current frame
+        ack_message = {
+            "type": "question_ack",
+            "status": "received",
+            "question": question
+        }
+        channel.send(json.dumps(ack_message))
+        
+    except Exception as e:
+        print(f"❌ [DEBUG] Error in handle_question: {e}")
+
 
 @app.post("/offer")
 async def offer(request: Request):
@@ -296,28 +481,8 @@ async def offer(request: Request):
         
         @channel.on("message")
         def on_message(message):
-            # Handle different message types
-            try:
-                if isinstance(message, str):
-                    data = json.loads(message)
-                    msg_type = data.get("type", "unknown")
-                    
-                    if msg_type == "start_narration":
-                        client_id = data.get("client_id", peer_id)
-                        print(f"🎙️ Starting narration for client {client_id} via data channel")
-                        # Save client identifier for this peer connection
-                        channel.client_id = client_id
-                        # Send acknowledgment
-                        channel.send(json.dumps({"type": "ack", "message": "Narration started"}))
-                    
-                    elif msg_type == "end_stream":
-                        print(f"🛑 End stream request received for peer {peer_id}")
-                        channel.send(json.dumps({"type": "ack", "message": "Stream ended"}))
-                        # Note: Connection cleanup happens in the track handler when it exits
-            except Exception as e:
-                print(f"❌ Error handling data channel message: {e}")
-                channel.send(json.dumps({"type": "error", "message": str(e)}))
-
+            asyncio.run(on_message(channel, message))
+            
     recorder = MediaBlackhole()
 
     @pc.on("track")
