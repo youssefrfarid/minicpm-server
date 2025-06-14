@@ -239,7 +239,7 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
                     message = {
                         "type": "narration",
                         "token": cleaned_token,
-                        "is_final": False
+                        "is_end": False
                     }
                     if narration_channel.readyState == "open":
                         narration_channel.send(json.dumps(message))
@@ -287,7 +287,7 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
                     message = {
                         "type": "narration",
                         "token": cleaned_response,
-                        "is_final": True
+                        "is_end": True
                     }
                     if narration_channel.readyState == "open":
                         narration_channel.send(json.dumps(message))
