@@ -230,6 +230,40 @@ async def offer(request: Request):
     pc = RTCPeerConnection()
     peer_id = str(uuid.uuid4())
     pcs[peer_id] = pc
+    
+    # Dictionary to store data channels per peer
+    data_channels = {}
+    
+    # Handle data channel creation
+    @pc.on("datachannel")
+    def on_datachannel(channel):
+        channel_id = channel.label
+        print(f"🔌 New data channel {channel_id} for peer {peer_id}")
+        data_channels[channel_id] = channel
+        
+        @channel.on("message")
+        async def on_message(message):
+            # Handle different message types
+            try:
+                if isinstance(message, str):
+                    data = json.loads(message)
+                    msg_type = data.get("type", "unknown")
+                    
+                    if msg_type == "start_narration":
+                        client_id = data.get("client_id", peer_id)
+                        print(f"🎙️ Starting narration for client {client_id} via data channel")
+                        # Save client identifier for this peer connection
+                        channel.client_id = client_id
+                        # Send acknowledgment
+                        await channel.send(json.dumps({"type": "ack", "message": "Narration started"}))
+                    
+                    elif msg_type == "end_stream":
+                        print(f"🛑 End stream request received for peer {peer_id}")
+                        await channel.send(json.dumps({"type": "ack", "message": "Stream ended"}))
+                        # Note: Connection cleanup happens in the track handler when it exits
+            except Exception as e:
+                print(f"❌ Error handling data channel message: {e}")
+                await channel.send(json.dumps({"type": "error", "message": str(e)}))
 
     recorder = MediaBlackhole()
 
@@ -271,25 +305,98 @@ async def offer(request: Request):
                 is_duplicate = False
                 if prev_frame_data is not None:
                     # Calculate Mean Squared Error between frames
-                    mse = np.mean((bgr.astype("float") - prev_frame_data.astype("float")) ** 2)
-                    is_duplicate = mse < 10.0  # Threshold for considering frames as duplicates
-                    if is_duplicate:
-                        duplicate_frames += 1
+                    if frame_counter % 30 == 0:
+                        frame_hash = hashlib.md5(rgb.tobytes()).hexdigest()
+                        if prev_frame_data == frame_hash:
+                            duplicate_frames += 1
+                        prev_frame_data = frame_hash
+                        
+                        # Report stats every 30 frames
+                        elapsed = ts - start_time
+                        fps = frame_counter / elapsed if elapsed > 0 else 0
+                        duplicate_pct = (duplicate_frames / frame_counter * 100) if frame_counter > 0 else 0
+                        print(f"WebRTC stats for {peer_id}: {frame_counter} frames in {elapsed:.1f}s "  
+                              f"({fps:.1f} FPS), {duplicate_pct:.1f}% duplicates")
                 
-                # Log detailed frame info
-                elapsed = ts - start_time
-                fps = frame_counter / elapsed if elapsed > 0 else 0
-                dup_percent = (duplicate_frames / frame_counter * 100) if frame_counter > 0 else 0
-                print(f"{ts:.3f} ▶️ Frame #{frame_counter} hash={frame_hash} {'🔄 DUPLICATE' if is_duplicate else '✅ UNIQUE'} "
-                      f"[{duplicate_frames}/{frame_counter} dupes={dup_percent:.1f}% fps={fps:.1f}]")
+                # Skip duplicate frames
+                if prev_img is not None:
+                    # Use point samples for quick similarity check
+                    if prev_frame_data == sample_points:
+                        continue
                 
-                # Save current frame for next comparison
-                prev_frame_data = bgr.copy()
+                # Get the data channel for narration output
+                narration_channel = data_channels.get('narration')
                 
-                pil = Image.fromarray(rgb)
-                emit_sid = latest_socket_sid or peer_id
-                await process_frame(emit_sid, pil, prev_img)
-                prev_img = pil
+                # Process this frame (generates narration) and send via data channel
+                rgb_pil = Image.fromarray(rgb)
+                
+                # Process frame with the narration channel
+                last_narration = last_narration_per_client.get(peer_id, "")
+                if prev_img is None or _compute_frame_similarity(prev_img, rgb_pil) < 0.95:  # Skip very similar frames
+                    # Proper async call to run MiniCPM in thread
+                    narration = await asyncio.to_thread(
+                        model.caption_with_audio, peer_id, [rgb_pil], tokenizer
+                    )
+                    narration = narration.strip()
+                    
+                    # Only send if the narration has changed
+                    if narration and narration != last_narration:
+                        # Send chunks for better real-time experience
+                        if len(narration) > 80:
+                            words = narration.split()
+                            chunks = []
+                            current = []
+                            total = 0
+                            
+                            # Break into ~50 char chunks on word boundaries 
+                            for word in words:
+                                if total + len(word) + 1 > 50 and current:
+                                    chunks.append(" ".join(current))
+                                    current = [word]
+                                    total = len(word)
+                                else:
+                                    current.append(word)
+                                    total += len(word) + 1
+                            if current:
+                                chunks.append(" ".join(current))
+                            
+                            # Send chunks with is_end flag on the last one
+                            for i, chunk in enumerate(chunks):
+                                is_last = i == len(chunks) - 1
+                                message = {
+                                    "type": "narration",
+                                    "token": chunk,
+                                    "is_end": is_last
+                                }
+                                
+                                # Send through data channel if available
+                                if narration_channel:
+                                    try:
+                                        await narration_channel.send(json.dumps(message))
+                                    except Exception as e:
+                                        print(f"Error sending via data channel: {e}")
+                                        # No WebSocket fallback here - this is pure WebRTC
+                                
+                                await asyncio.sleep(0.1)  # Slight delay between chunks 
+                        else:
+                            message = {
+                                "type": "narration",
+                                "token": narration,
+                                "is_end": True
+                            }
+                            
+                            # Send through data channel if available
+                            if narration_channel:
+                                try:
+                                    await narration_channel.send(json.dumps(message))
+                                except Exception as e:
+                                    print(f"Error sending via data channel: {e}")
+                        
+                        last_narration_per_client[peer_id] = narration
+                
+                prev_img = rgb_pil
+                prev_frame_data = sample_points
+                
         elif track.kind == "audio":
             await recorder.start()
             track.add_sink(recorder)
