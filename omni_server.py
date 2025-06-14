@@ -117,8 +117,10 @@ def _compute_frame_similarity(img1: Image.Image, img2: Image.Image) -> float:
 
 
 def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Image.Image]):
-    """Blocking call that interacts with MiniCPM-o and streams tokens out."""
+    """Blocking call that interacts with MiniCPM-o and returns the response."""
     last_narr = last_narration_per_client.get(sid, "")
+    
+    # Build context-aware prompt
     if last_narr:
         prompt_text = (
             "Continue narrating while ignoring static background details. "
@@ -130,11 +132,31 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
             "background details. What's happening now?"
         )
 
-    # Use official MiniCPM-o-2.6 API format
-    msgs = [{'role': 'user', 'content': [curr_img, prompt_text]}]
+    # Use official MiniCPM-o-2.6 API format with system instruction
+    msgs = [
+        {
+            'role': 'system', 
+            'content': [
+                "You are a live video narration assistant for visually impaired users. "
+                "Provide concise, real-time descriptions of what's happening in the video. "
+                "Focus on movement, actions, and important changes. "
+                "Ignore static backgrounds and irrelevant details. "
+                "Keep responses to 1-2 sentences maximum. "
+                "Be descriptive but brief."
+            ]
+        },
+        {
+            'role': 'user', 
+            'content': [curr_img, prompt_text]
+        }
+    ]
+    
+    # Add previous frame for better context if available
+    if prev_img is not None:
+        msgs[1]['content'].insert(-1, prev_img)  # Add prev_img before prompt_text
     
     try:
-        # Use official chat method with streaming (if available) or full response
+        # Use official chat method
         response = model.chat(
             msgs=msgs,
             tokenizer=tokenizer,
@@ -154,59 +176,63 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
             
             if cleaned_response:
                 last_narration_per_client[sid] = cleaned_response
-                
-                # Get the data channel for narration output from global storage
-                peer_channels = global_data_channels.get(sid, {})
-                narration_channel = peer_channels.get('narration')
-                
-                # Send the complete response as narration tokens
-                # For real-time feel, split into words and send progressively
-                words = cleaned_response.split()
-                for i, word in enumerate(words):
-                    message = {
-                        "type": "narration",
-                        "token": word + (" " if i < len(words) - 1 else ""),
-                        "is_final": i == len(words) - 1
-                    }
-                    
-                    # Send through data channel if available
-                    if narration_channel:
-                        try:
-                            narration_channel.send(json.dumps(message))
-                            time.sleep(0.05)  # Small delay for streaming effect
-                        except Exception as e:
-                            print(f"Error sending via data channel: {e}")
-                            break
-                
-                # Send final completion message
-                if narration_channel:
-                    try:
-                        completion_message = {
-                            "type": "narration_complete",
-                            "full_text": cleaned_response
-                        }
-                        narration_channel.send(json.dumps(completion_message))
-                    except Exception as e:
-                        print(f"Error sending completion via data channel: {e}")
+                return cleaned_response  # Return result instead of sending via data channel
+        
+        return None
         
     except Exception as e:
         print(f"Error in MiniCPM-o inference: {e}")
-        # Send error message via data channel
-        peer_channels = global_data_channels.get(sid, {})
-        narration_channel = peer_channels.get('narration')
-        if narration_channel:
-            try:
-                error_message = {
-                    "type": "error",
-                    "message": f"Inference error: {str(e)}"
-                }
-                narration_channel.send(json.dumps(error_message))
-            except Exception as send_e:
-                print(f"Error sending error message: {send_e}")
+        return f"ERROR: {str(e)}"
 
 
 async def process_frame(sid: str, curr_img: Image.Image, prev_img: Optional[Image.Image]):
-    return await asyncio.to_thread(_process_frame_sync, sid, curr_img, prev_img)
+    """Process frame and send results via data channel in main loop."""
+    # Run model inference in thread pool
+    result = await asyncio.to_thread(_process_frame_sync, sid, curr_img, prev_img)
+    
+    if result:
+        # Get the data channel for narration output from main loop
+        peer_channels = global_data_channels.get(sid, {})
+        narration_channel = peer_channels.get('narration')
+        
+        if result.startswith("ERROR:"):
+            # Send error message
+            if narration_channel:
+                try:
+                    error_message = {
+                        "type": "error", 
+                        "message": result
+                    }
+                    narration_channel.send(json.dumps(error_message))
+                except Exception as e:
+                    print(f"Error sending error via data channel: {e}")
+        else:
+            # Send successful narration result
+            if narration_channel:
+                try:
+                    # Send the complete response as narration tokens
+                    # For real-time feel, split into words and send progressively
+                    words = result.split()
+                    for i, word in enumerate(words):
+                        message = {
+                            "type": "narration",
+                            "token": word + (" " if i < len(words) - 1 else ""),
+                            "is_final": i == len(words) - 1
+                        }
+                        narration_channel.send(json.dumps(message))
+                        await asyncio.sleep(0.05)  # Small delay for streaming effect
+                    
+                    # Send final completion message
+                    completion_message = {
+                        "type": "narration_complete",
+                        "full_text": result
+                    }
+                    narration_channel.send(json.dumps(completion_message))
+                    
+                except Exception as e:
+                    print(f"Error sending narration via data channel: {e}")
+    
+    return result
 
 # ─── WebRTC signalling & media ingestion ───────────────────────────────
 app = FastAPI()
