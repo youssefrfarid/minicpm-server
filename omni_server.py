@@ -178,12 +178,27 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
     print(f"🔄 [DEBUG] Calling model streaming with {len(msgs)} messages...")
     
     try:
-        # Get the data channel for narration output from global storage
-        peer_channels = global_data_channels.get(sid, {})
-        narration_channel = peer_channels.get('narration')
+        # Wait for narration channel to be available (max 5 seconds)
+        max_attempts = 10
+        wait_time = 0.5  # seconds per attempt
+        attempts = 0
+        narration_channel = None
+
+        while attempts < max_attempts:
+            # Get the data channel for narration output from global storage
+            peer_channels = global_data_channels.get(sid, {})
+            narration_channel = peer_channels.get('narration')
+            
+            if narration_channel:
+                print(f"✅ [DEBUG] Narration channel found for peer {sid} after {attempts * wait_time:.1f}s")
+                break
+            
+            print(f"⚠️ [DEBUG] Waiting for narration channel to be ready for peer {sid}, attempt {attempts+1}/{max_attempts}")
+            attempts += 1
+            time.sleep(wait_time)
         
         if not narration_channel:
-            print(f"⚠️ [DEBUG] No narration channel found for peer {sid}")
+            print(f"❌ [DEBUG] No narration channel found for peer {sid} after {max_attempts * wait_time:.1f}s")
             return None
         
         # Try to use streaming if available, otherwise fall back to chat
@@ -191,6 +206,7 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
             # Attempt to use streaming methods (if available)
             response_stream = model.streaming_generate(
                 msgs=msgs,
+                tokenizer=tokenizer,
                 session_id=sid,
                 max_new_tokens=100,
                 temperature=0.2,
@@ -225,7 +241,8 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
                         "token": cleaned_token,
                         "is_final": False
                     }
-                    narration_channel.send(json.dumps(message))
+                    if narration_channel.readyState == "open":
+                        narration_channel.send(json.dumps(message))
                     print(f"🔄 [DEBUG] Streamed token: '{cleaned_token}'")
             
             # Send completion
@@ -245,6 +262,7 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
             # Fallback to regular chat method
             response = model.chat(
                 msgs=msgs,
+                tokenizer=tokenizer,
                 session_id=sid,
                 max_new_tokens=100,
                 temperature=0.2,
@@ -271,13 +289,15 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
                         "token": cleaned_response,
                         "is_final": True
                     }
-                    narration_channel.send(json.dumps(message))
+                    if narration_channel.readyState == "open":
+                        narration_channel.send(json.dumps(message))
                     
                     completion_message = {
                         "type": "narration_complete",
                         "full_text": cleaned_response
                     }
-                    narration_channel.send(json.dumps(completion_message))
+                    if narration_channel.readyState == "open":
+                        narration_channel.send(json.dumps(completion_message))
                     
                     last_narration_per_client[sid] = cleaned_response
                     print(f"✅ [DEBUG] Sent complete response: '{cleaned_response}'")
@@ -294,12 +314,15 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
         # Send error via data channel
         peer_channels = global_data_channels.get(sid, {})
         narration_channel = peer_channels.get('narration')
-        if narration_channel:
-            error_message = {
-                "type": "error",
-                "message": f"Inference error: {str(e)}"
-            }
-            narration_channel.send(json.dumps(error_message))
+        if narration_channel and narration_channel.readyState == "open":
+            try:
+                error_message = {
+                    "type": "error",
+                    "message": f"Inference error: {str(e)}"
+                }
+                narration_channel.send(json.dumps(error_message))
+            except Exception as channel_err:
+                print(f"❌ [DEBUG] Error sending to data channel: {channel_err}")
         
         return f"ERROR: {str(e)}"
 
@@ -534,7 +557,8 @@ async def offer(request: Request):
                                 # Send through data channel if available
                                 if narration_channel:
                                     try:
-                                        narration_channel.send(json.dumps(message))
+                                        if narration_channel.readyState == "open":
+                                            narration_channel.send(json.dumps(message))
                                     except Exception as e:
                                         print(f"Error sending via data channel: {e}")
                                         # No WebSocket fallback here - this is pure WebRTC
@@ -550,7 +574,8 @@ async def offer(request: Request):
                             # Send through data channel if available
                             if narration_channel:
                                 try:
-                                    narration_channel.send(json.dumps(message))
+                                    if narration_channel.readyState == "open":
+                                        narration_channel.send(json.dumps(message))
                                 except Exception as e:
                                     print(f"Error sending via data channel: {e}")
                         
