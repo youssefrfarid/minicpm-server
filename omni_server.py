@@ -1,28 +1,28 @@
-"""Unified ASGI server for LumiMate live narration.
+"""Pure WebRTC ASGI server for LumiMate live narration.
 
-This file merges:
-  • Flask-SocketIO text/tokens server (previous `server.py`)
-  • WebRTC video ingress server (previous `webrtc_server.py`)
-into one asyncio-friendly FastAPI / python-socketio ASGI application.
+This server uses FastAPI for WebRTC signalling (SDP offer/answer)
+and aiortc for handling WebRTC peer connections and data channels.
+Narration tokens are streamed over a WebRTC data channel.
 
 Run with:
-    uvicorn lib.services.omni_server:asgi_app --host 0.0.0.0 --port 8123
+    uvicorn lib.services.omni_server:app --host 0.0.0.0 --port 8000 --reload
 
-Socket paths / ports
-    /socket.io        – Socket.IO websocket (narration tokens, control)
+Endpoints:
     POST /offer       – WebRTC signalling (SDP offer → answer)
-Media (UDP) ports are negotiated via ICE; open 10000-10100/UDP on the VM.
+
+Data Channels:
+    'narration'       – For sending narration tokens from server to client.
+    'control'         – For control messages (e.g., start/stop narration) from client to server.
+
+Media (UDP) ports are negotiated via ICE; ensure relevant UDP ports are open if behind NAT/firewall.
 
 Dependencies (pip install):
-    fastapi uvicorn[standard] python-socketio[asgi] aiortc opencv-python
+    fastapi uvicorn[standard] aiortc opencv-python Pillow
 
-Notes
------
-• MiniCPM-o model is loaded once and shared by both paths.
-• All heavy model calls run in a background thread via asyncio.to_thread so
-  the event-loop stays responsive.
-• Only video is streamed over WebRTC; audio is dropped.  The existing
-  sentence-level TTS buffer stays unchanged on the phone.
+Notes:
+- MiniCPM-o model is loaded once and shared.
+- Heavy model calls run in a background thread via asyncio.to_thread.
+- Video is received via WebRTC, processed, and narration is sent back.
 """
 from __future__ import annotations
 import asyncio
@@ -42,9 +42,8 @@ import cv2
 from PIL import Image
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
-from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack, RTCDataChannel
 from aiortc.contrib.media import MediaBlackhole
-import socketio  # python-socketio ASGI implementation
 
 import torch
 from transformers import AutoModel, AutoTokenizer
@@ -70,10 +69,8 @@ MAX_VIDEO_HISTORY = 30  # tokens of history for each client
 last_narration_per_client: Dict[str, str] = {}
 previous_frame_per_client: Dict[str, Optional[Image.Image]] = {}
 
-# Main asyncio event loop (captured on first Socket.IO connection)
-main_loop: Optional[asyncio.AbstractEventLoop] = None
-# Latest connected Socket.IO sid (single-client assumption)
-latest_socket_sid: Optional[str] = None
+# Store peer connections and other client-specific data
+pcs: Dict[str, RTCPeerConnection] = {}
 
 # ─── Helper functions ───────────────────────────────────────────────────
 
@@ -130,97 +127,18 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
         )
         if token.strip():
             current_segment += token
-            if main_loop is not None:
-                asyncio.run_coroutine_threadsafe(
-                    sio.emit("token", {"text": token}, room=sid), main_loop
-                )
 
     if current_segment:
         last_narration_per_client[sid] = current_segment.strip()
 
-    if main_loop is not None:
-        asyncio.run_coroutine_threadsafe(
-            sio.emit("narration_segment_end", room=sid), main_loop
-        )
-    print(f"[{sid}] 📤 Narration segment sent.")
+    return current_segment
 
 
 async def process_frame(sid: str, curr_img: Image.Image, prev_img: Optional[Image.Image]):
-    await asyncio.to_thread(_process_frame_sync, sid, curr_img, prev_img)
-
-# ─── Socket.IO setup (ASGI) ─────────────────────────────────────────────
-
-sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
-app = FastAPI()
-
-@sio.event
-async def connect(sid, environ, auth):
-    global latest_socket_sid
-    global main_loop
-    # Capture running loop for cross-thread emissions
-    if main_loop is None:
-        main_loop = asyncio.get_running_loop()
-
-    print(f"🟢 Client connected: {sid}")
-    latest_socket_sid = sid
-    last_narration_per_client[sid] = ""
-    previous_frame_per_client[sid] = None
-
-    model.reset_session()
-    sys_msg = model.get_sys_prompt(mode="omni", language="en")
-    model.streaming_prefill(sid, [sys_msg], tokenizer)
-
-    live_instr = (
-        "You are a live video narrator for a visually impaired user, acting as their eyes. "
-        "Your descriptions should be immediate, concise, and in the present tense. "
-        "Start sentences with 'You are looking at…' or 'You see…'."
-    )
-    model.streaming_prefill(sid, [{"role": "user", "content": live_instr}], tokenizer)
-
-@sio.event
-async def disconnect(sid):
-    print(f"🔴 Client disconnected: {sid}")
-    last_narration_per_client.pop(sid, None)
-    previous_frame_per_client.pop(sid, None)
-
-@sio.on("message")
-async def handle_message(sid, msg):
-    msg_type = msg.get("type", "unknown")
-    if msg_type == "video_frame":
-        img_b64 = msg.get("image_b64")
-        if not img_b64:
-            return
-        img = _decode_image_from_base64(img_b64)
-        if img is None:
-            return
-        prev_img = previous_frame_per_client.get(sid)
-        await process_frame(sid, img, prev_img)
-        previous_frame_per_client[sid] = img
-    elif msg_type == "init":
-        txt = msg.get("text", "")
-        model.streaming_prefill(sid, [{"role": "user", "content": txt}], tokenizer)
-        await sio.emit("ack", {"text": "Instruction received"}, room=sid)
-    elif msg_type == "question":
-        q = msg.get("text", "")
-        model.streaming_prefill(sid, [{"role": "user", "content": q}], tokenizer)
-        # simple blocking answer generation
-        answer_tokens = []
-        for r in model.streaming_generate(
-            sid,
-            images=None,
-            tokenizer=tokenizer,
-            generate_audio=False,
-        ):
-            t = r.get("text", getattr(r, "text", ""))
-            if t:
-                answer_tokens.append(t)
-        answer = "".join(answer_tokens).strip()
-        await sio.emit("answer", {"text": answer}, room=sid)
-    elif msg_type == "end_stream_request":
-        await sio.emit("stream_ended_ack", room=sid)
+    return await asyncio.to_thread(_process_frame_sync, sid, curr_img, prev_img)
 
 # ─── WebRTC signalling & media ingestion ───────────────────────────────
-pcs: Dict[str, RTCPeerConnection] = {}
+app = FastAPI()
 
 @app.post("/offer")
 async def offer(request: Request):
@@ -336,10 +254,7 @@ async def offer(request: Request):
                 last_narration = last_narration_per_client.get(peer_id, "")
                 if prev_img is None or _compute_frame_similarity(prev_img, rgb_pil) < 0.95:  # Skip very similar frames
                     # Proper async call to run MiniCPM in thread
-                    narration = await asyncio.to_thread(
-                        model.caption_with_audio, peer_id, [rgb_pil], tokenizer
-                    )
-                    narration = narration.strip()
+                    narration = await process_frame(peer_id, rgb_pil, prev_img)
                     
                     # Only send if the narration has changed
                     if narration and narration != last_narration:
@@ -416,9 +331,6 @@ async def offer(request: Request):
 
     return JSONResponse({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
 
-# ─── Combine ASGI apps ─────────────────────────────────────────────────
-asgi_app = socketio.ASGIApp(sio, other_asgi_app=app)
-
 if __name__ == "__main__":
     import argparse
     import uvicorn
@@ -428,4 +340,4 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8123)
     args = parser.parse_args()
 
-    uvicorn.run(asgi_app, host=args.host, port=args.port, log_level="info")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
