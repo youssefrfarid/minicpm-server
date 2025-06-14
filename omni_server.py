@@ -64,13 +64,18 @@ model = AutoModel.from_pretrained(
 tokenizer = AutoTokenizer.from_pretrained("openbmb/MiniCPM-o-2_6", trust_remote_code=True)
 print("✅ Model loaded", flush=True)
 
+# ─── Global state management ───────────────────────────────────────────────
+
+# Track peer connections
+pcs: Dict[str, RTCPeerConnection] = {}
+last_narration_per_client: Dict[str, str] = {}
+
+# Global data channels storage (keyed by peer_id then channel_label)
+global_data_channels: Dict[str, Dict[str, RTCDataChannel]] = {}
+
 # ─── Shared session state ───────────────────────────────────────────────
 MAX_VIDEO_HISTORY = 30  # tokens of history for each client
-last_narration_per_client: Dict[str, str] = {}
 previous_frame_per_client: Dict[str, Optional[Image.Image]] = {}
-
-# Store peer connections and other client-specific data
-pcs: Dict[str, RTCPeerConnection] = {}
 
 # ─── Helper functions ───────────────────────────────────────────────────
 
@@ -150,8 +155,9 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
             if cleaned_response:
                 last_narration_per_client[sid] = cleaned_response
                 
-                # Get the data channel for narration output  
-                narration_channel = data_channels.get('narration')
+                # Get the data channel for narration output from global storage
+                peer_channels = global_data_channels.get(sid, {})
+                narration_channel = peer_channels.get('narration')
                 
                 # Send the complete response as narration tokens
                 # For real-time feel, split into words and send progressively
@@ -186,7 +192,8 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
     except Exception as e:
         print(f"Error in MiniCPM-o inference: {e}")
         # Send error message via data channel
-        narration_channel = data_channels.get('narration')
+        peer_channels = global_data_channels.get(sid, {})
+        narration_channel = peer_channels.get('narration')
         if narration_channel:
             try:
                 error_message = {
@@ -215,15 +222,14 @@ async def offer(request: Request):
     peer_id = str(uuid.uuid4())
     pcs[peer_id] = pc
     
-    # Dictionary to store data channels per peer
-    data_channels = {}
-    
     # Handle data channel creation
     @pc.on("datachannel")
     def on_datachannel(channel):
         channel_id = channel.label
         print(f"🔌 New data channel {channel_id} for peer {peer_id}")
-        data_channels[channel_id] = channel
+        if peer_id not in global_data_channels:
+            global_data_channels[peer_id] = {}
+        global_data_channels[peer_id][channel_id] = channel
         
         @channel.on("message")
         def on_message(message):
@@ -308,8 +314,9 @@ async def offer(request: Request):
                     if prev_frame_data == sample_points:
                         continue
                 
-                # Get the data channel for narration output
-                narration_channel = data_channels.get('narration')
+                # Get the data channel for narration output from global storage
+                peer_channels = global_data_channels.get(peer_id, {})
+                narration_channel = peer_channels.get('narration')
                 
                 # Process this frame (generates narration) and send via data channel
                 rgb_pil = Image.fromarray(rgb)
