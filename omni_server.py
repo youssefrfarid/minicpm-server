@@ -118,6 +118,10 @@ def _compute_frame_similarity(img1: Image.Image, img2: Image.Image) -> float:
 
 def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Image.Image]):
     """Blocking call that interacts with MiniCPM-o and returns the response."""
+    print(f"🔄 [DEBUG] Starting inference for peer {sid}")
+    print(f"🔄 [DEBUG] Current image size: {curr_img.size}")
+    print(f"🔄 [DEBUG] Previous image: {'Available' if prev_img else 'None'}")
+    
     last_narr = last_narration_per_client.get(sid, "")
     
     # Build context-aware prompt
@@ -126,11 +130,13 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
             "Continue narrating while ignoring static background details. "
             f"Previously you said: '{last_narr}'. What is happening now?"
         )
+        print(f"🔄 [DEBUG] Using continuation prompt with last narration: '{last_narr[:50]}...'")
     else:
         prompt_text = (
             "Focus on the main subjects and their actions. Ignore static "
             "background details. What's happening now?"
         )
+        print(f"🔄 [DEBUG] Using initial prompt (no previous narration)")
 
     # Use official MiniCPM-o-2.6 API format with system instruction
     msgs = [
@@ -154,6 +160,9 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
     # Add previous frame for better context if available
     if prev_img is not None:
         msgs[1]['content'].insert(-1, prev_img)  # Add prev_img before prompt_text
+        print(f"🔄 [DEBUG] Added previous frame to message")
+    
+    print(f"🔄 [DEBUG] Calling model.chat with {len(msgs)} messages...")
     
     try:
         # Use official chat method
@@ -165,6 +174,9 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
             do_sample=True
         )
         
+        print(f"🔄 [DEBUG] Raw model response: '{response}'")
+        print(f"🔄 [DEBUG] Response type: {type(response)}")
+        
         # Clean up response tokens
         if response:
             cleaned_response = (
@@ -174,26 +186,42 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
                 .strip()
             )
             
+            print(f"🔄 [DEBUG] Cleaned response: '{cleaned_response}'")
+            
             if cleaned_response:
                 last_narration_per_client[sid] = cleaned_response
+                print(f"✅ [DEBUG] Inference successful, returning: '{cleaned_response}'")
                 return cleaned_response  # Return result instead of sending via data channel
+            else:
+                print(f"⚠️ [DEBUG] Cleaned response is empty")
+        else:
+            print(f"⚠️ [DEBUG] Model returned None/empty response")
         
         return None
         
     except Exception as e:
-        print(f"Error in MiniCPM-o inference: {e}")
+        print(f"❌ [DEBUG] Error in MiniCPM-o inference: {e}")
+        print(f"❌ [DEBUG] Exception type: {type(e)}")
+        import traceback
+        traceback.print_exc()
         return f"ERROR: {str(e)}"
 
 
 async def process_frame(sid: str, curr_img: Image.Image, prev_img: Optional[Image.Image]):
     """Process frame and send results via data channel in main loop."""
+    print(f"🎬 [DEBUG] process_frame called for peer {sid}")
+    
     # Run model inference in thread pool
+    print(f"🎬 [DEBUG] Starting inference in thread pool...")
     result = await asyncio.to_thread(_process_frame_sync, sid, curr_img, prev_img)
+    print(f"🎬 [DEBUG] Inference completed, result: '{result}'")
     
     if result:
         # Get the data channel for narration output from main loop
         peer_channels = global_data_channels.get(sid, {})
         narration_channel = peer_channels.get('narration')
+        
+        print(f"🎬 [DEBUG] Data channel available: {narration_channel is not None}")
         
         if result.startswith("ERROR:"):
             # Send error message
@@ -204,8 +232,9 @@ async def process_frame(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
                         "message": result
                     }
                     narration_channel.send(json.dumps(error_message))
+                    print(f"❌ [DEBUG] Sent error message via data channel")
                 except Exception as e:
-                    print(f"Error sending error via data channel: {e}")
+                    print(f"❌ [DEBUG] Error sending error via data channel: {e}")
         else:
             # Send successful narration result
             if narration_channel:
@@ -213,6 +242,8 @@ async def process_frame(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
                     # Send the complete response as narration tokens
                     # For real-time feel, split into words and send progressively
                     words = result.split()
+                    print(f"🎬 [DEBUG] Sending {len(words)} words via data channel...")
+                    
                     for i, word in enumerate(words):
                         message = {
                             "type": "narration",
@@ -220,6 +251,7 @@ async def process_frame(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
                             "is_final": i == len(words) - 1
                         }
                         narration_channel.send(json.dumps(message))
+                        print(f"🎬 [DEBUG] Sent word {i+1}/{len(words)}: '{word}'")
                         await asyncio.sleep(0.05)  # Small delay for streaming effect
                     
                     # Send final completion message
@@ -228,9 +260,14 @@ async def process_frame(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
                         "full_text": result
                     }
                     narration_channel.send(json.dumps(completion_message))
+                    print(f"🎬 [DEBUG] Sent completion message")
                     
                 except Exception as e:
-                    print(f"Error sending narration via data channel: {e}")
+                    print(f"❌ [DEBUG] Error sending narration via data channel: {e}")
+            else:
+                print(f"⚠️ [DEBUG] No narration channel found for peer {sid}")
+    else:
+        print(f"⚠️ [DEBUG] No result to send for peer {sid}")
     
     return result
 
