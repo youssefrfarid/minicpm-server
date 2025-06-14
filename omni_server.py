@@ -5,7 +5,7 @@ and aiortc for handling WebRTC peer connections and data channels.
 Narration tokens are streamed over a WebRTC data channel.
 
 Run with:
-    uvicorn lib.services.omni_server:app --host 0.0.0.0 --port 8000 --reload
+    uvicorn lib.services.omni_server:app --host 0.0.0.0 --port 8123 --reload
 
 Endpoints:
     POST /offer       – WebRTC signalling (SDP offer → answer)
@@ -88,6 +88,29 @@ def _decode_image_from_base64(image_b64: str) -> Optional[Image.Image]:
         return None
 
 
+def _compute_frame_similarity(img1: Image.Image, img2: Image.Image) -> float:
+    """Compute similarity between two PIL Images using histograms."""
+    try:
+        # Convert to numpy arrays for faster processing
+        arr1 = np.array(img1.resize((64, 64)))  # Resize for speed
+        arr2 = np.array(img2.resize((64, 64)))
+        
+        # Compute histogram correlation
+        hist1 = np.histogram(arr1.flatten(), bins=50)[0]
+        hist2 = np.histogram(arr2.flatten(), bins=50)[0]
+        
+        # Normalize histograms
+        hist1 = hist1 / np.sum(hist1)
+        hist2 = hist2 / np.sum(hist2)
+        
+        # Compute correlation coefficient
+        correlation = np.corrcoef(hist1, hist2)[0, 1]
+        return correlation if not np.isnan(correlation) else 0.0
+    except Exception as e:
+        print(f"Error computing frame similarity: {e}")
+        return 0.0
+
+
 def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Image.Image]):
     """Blocking call that interacts with MiniCPM-o and streams tokens out."""
     last_narr = last_narration_per_client.get(sid, "")
@@ -162,7 +185,7 @@ async def offer(request: Request):
         data_channels[channel_id] = channel
         
         @channel.on("message")
-        async def on_message(message):
+        def on_message(message):
             # Handle different message types
             try:
                 if isinstance(message, str):
@@ -175,15 +198,15 @@ async def offer(request: Request):
                         # Save client identifier for this peer connection
                         channel.client_id = client_id
                         # Send acknowledgment
-                        await channel.send(json.dumps({"type": "ack", "message": "Narration started"}))
+                        channel.send(json.dumps({"type": "ack", "message": "Narration started"}))
                     
                     elif msg_type == "end_stream":
                         print(f"🛑 End stream request received for peer {peer_id}")
-                        await channel.send(json.dumps({"type": "ack", "message": "Stream ended"}))
+                        channel.send(json.dumps({"type": "ack", "message": "Stream ended"}))
                         # Note: Connection cleanup happens in the track handler when it exits
             except Exception as e:
                 print(f"❌ Error handling data channel message: {e}")
-                await channel.send(json.dumps({"type": "error", "message": str(e)}))
+                channel.send(json.dumps({"type": "error", "message": str(e)}))
 
     recorder = MediaBlackhole()
 
@@ -289,7 +312,7 @@ async def offer(request: Request):
                                 # Send through data channel if available
                                 if narration_channel:
                                     try:
-                                        await narration_channel.send(json.dumps(message))
+                                        narration_channel.send(json.dumps(message))
                                     except Exception as e:
                                         print(f"Error sending via data channel: {e}")
                                         # No WebSocket fallback here - this is pure WebRTC
@@ -305,7 +328,7 @@ async def offer(request: Request):
                             # Send through data channel if available
                             if narration_channel:
                                 try:
-                                    await narration_channel.send(json.dumps(message))
+                                    narration_channel.send(json.dumps(message))
                                 except Exception as e:
                                     print(f"Error sending via data channel: {e}")
                         
