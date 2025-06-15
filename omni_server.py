@@ -203,55 +203,77 @@ def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Imag
         
         # Try to use streaming if available, otherwise fall back to chat
         try:
-            # Attempt to use streaming methods (if available)
+            # Add additional parameters to model to fix the streaming issues
+            print(f"🔄 [DEBUG] Attempting streaming_generate with additional parameters")
             response_stream = model.streaming_generate(
                 msgs=msgs,
                 tokenizer=tokenizer,
                 session_id=sid,
                 max_new_tokens=100,
                 temperature=0.2,
-                repetition_penalty=1.05
+                repetition_penalty=1.05,
+                eos_token_id=tokenizer.eos_token_id,  # Add EOS token ID explicitly
+                device=model.device                    # Ensure device is correctly set
             )
             
+            if response_stream is None:
+                raise ValueError("Streaming API returned None")
+                
             print(f"🔄 [DEBUG] Using streaming_generate for real-time tokens")
             full_response = ""
             
-            # Stream tokens as they're generated
-            for token_data in response_stream:
-                if isinstance(token_data, dict) and 'token' in token_data:
-                    token = token_data['token']
-                elif isinstance(token_data, str):
-                    token = token_data
-                else:
-                    continue
-                
-                # Clean token
-                cleaned_token = (
-                    token.replace("<|audio_sep|>", "")
-                    .replace("<|tts_eos|>", "")
-                    .replace("<|tts|>", "")
-                )
-                
-                if cleaned_token.strip():
-                    full_response += cleaned_token
+            # Stream tokens as they're generated - more defensively
+            try:
+                for token_data in response_stream:
+                    # Debug the token data structure
+                    print(f"🔄 [DEBUG] Token data type: {type(token_data).__name__}")
                     
-                    # Send token immediately
-                    message = {
-                        "type": "narration",
-                        "token": cleaned_token,
-                        "is_end": False
-                    }
-                    if narration_channel.readyState == "open":
-                        narration_channel.send(json.dumps(message))
-                    print(f"🔄 [DEBUG] Streamed token: '{cleaned_token}'")
+                    # Extract token based on data type
+                    token = None
+                    if isinstance(token_data, dict) and 'token' in token_data:
+                        token = token_data['token']
+                    elif isinstance(token_data, dict) and 'text' in token_data:
+                        token = token_data['text']
+                    elif isinstance(token_data, str):
+                        token = token_data
+                    else:
+                        print(f"🔄 [DEBUG] Unknown token format: {token_data}")
+                        continue
+                    
+                    # Clean token
+                    cleaned_token = (
+                        token.replace("<|audio_sep|>", "")
+                        .replace("<|tts_eos|>", "")
+                        .replace("<|tts|>", "")
+                    )
+                    
+                    if cleaned_token.strip():
+                        full_response += cleaned_token
+                        
+                        # Send token immediately
+                        message = {
+                            "type": "narration",
+                            "token": cleaned_token,
+                            "is_end": False
+                        }
+                        if narration_channel.readyState == "open":
+                            narration_channel.send(json.dumps(message))
+                        print(f"🔄 [DEBUG] Streamed token: '{cleaned_token}'")
+            except Exception as e:
+                print(f"⚠️ [DEBUG] Error processing streaming tokens: {e}")
+                raise
             
             # Send completion
             if full_response.strip():
+                # Send final narration token with is_end=true for streaming case
                 completion_message = {
-                    "type": "narration_complete",
-                    "full_text": full_response.strip()
+                    "type": "narration",
+                    "token": full_response.strip(),
+                    "is_end": True
                 }
-                narration_channel.send(json.dumps(completion_message))
+                if narration_channel.readyState == "open":
+                    narration_channel.send(json.dumps(completion_message))
+                    
                 last_narration_per_client[sid] = full_response.strip()
                 print(f"✅ [DEBUG] Streaming complete: '{full_response.strip()}'")
                 return full_response.strip()
@@ -456,8 +478,10 @@ async def offer(request: Request):
 
     @pc.on("track")
     async def on_track(track):
+        """Handle incoming WebRTC media tracks."""
         if track.kind == "video":
-            print(f"📺 Video track for peer {peer_id}")
+            print(f"📺 Video track for peer {pc.id}")
+            
             prev_img = None
             prev_frame_data = None
             frame_counter = 0
@@ -465,15 +489,21 @@ async def offer(request: Request):
             start_time = time.time()
             
             while True:
-                frame = await track.recv()
-                bgr = frame.to_ndarray(format="bgr24")
-                bgr = cv2.resize(bgr, (320, 320), interpolation=cv2.INTER_AREA)
-                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                
-                # Enhanced frame debugging with sample points and difference detection
-                frame_counter += 1
-                ts = time.time()
-                
+                try:
+                    frame = await track.recv()
+                    # Get timestamp for FPS calculation
+                    timestamp = time.time()
+                    
+                    # Store frame details for statistics
+                    global_peer_data.setdefault(pc.id, {}).setdefault('frames', []).append(timestamp)
+                    
+                    bgr = frame.to_ndarray(format="bgr24")
+                    bgr = cv2.resize(bgr, (320, 320), interpolation=cv2.INTER_AREA)
+                    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                except aiortc.mediastreams.MediaStreamError:
+                    # This is expected when the client disconnects
+                    print(f"🔌 Video track ended for peer {pc.id}")
+                    break
                 # Take sample points from frame to create a reliable signature
                 # We sample at multiple points to catch small movements
                 h, w, _ = bgr.shape
