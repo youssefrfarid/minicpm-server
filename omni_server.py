@@ -459,6 +459,7 @@ async def offer(request: Request):
 
     pc = RTCPeerConnection()
     peer_id = str(uuid.uuid4())
+    pc.id = peer_id  # Assign the peer_id to the connection object
     pcs[peer_id] = pc
     
     # Handle data channel creation
