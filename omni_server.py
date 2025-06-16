@@ -251,10 +251,6 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
             tokenizer=tokenizer,
             temperature=0.2,
             max_new_tokens=100,
-            repetition_penalty=1.05,
-            eos_token_id=tokenizer.eos_token_id,
-            device=model.device,
-            omni_input=True
         )
 
         # Process streaming response
@@ -309,7 +305,7 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
     except Exception as e:
         print(f"⚠️ [ERROR] Error during streaming generation: {str(e)}")
         try:
-            model.reset_session(session_id=sid)
+            model.reset_session()
         except Exception as cleanup_error:
             print(
                 f"⚠️ [ERROR] Error cleaning up session: {str(cleanup_error)}")
