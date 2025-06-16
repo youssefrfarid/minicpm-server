@@ -58,7 +58,7 @@ model = AutoModel.from_pretrained(
     torch_dtype=torch.bfloat16,
     init_vision=True,
     init_audio=True,
-    init_tts=False,
+    init_tts=True,
 ).eval().cuda()
 
 tokenizer = AutoTokenizer.from_pretrained(
