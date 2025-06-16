@@ -440,19 +440,6 @@ async def offer(request: Request):
     # Initialize data channels dictionary for this peer
     global_data_channels[peer_id] = {}
 
-    # Create narration data channel from server side
-    narration_channel = pc.createDataChannel("narration")
-    global_data_channels[peer_id]["narration"] = narration_channel
-
-    @narration_channel.on("open")
-    def on_narration_open():
-        print(f"🔌 Narration channel opened for peer {peer_id}")
-
-    @narration_channel.on("message")
-    def on_narration_message(message):
-        # Handle messages from client on narration channel
-        asyncio.create_task(on_message(narration_channel, message))
-
     # Handle any additional data channels created by the client
     @pc.on("datachannel")
     def on_datachannel(channel):
@@ -461,9 +448,21 @@ async def offer(request: Request):
             f"🔌 Client-created data channel '{channel_id}' for peer {peer_id}")
         global_data_channels[peer_id][channel_id] = channel
 
-        @channel.on("message")
-        def on_channel_message(message):
-            asyncio.create_task(on_message(channel, message))
+        # Special handling for narration channel
+        if channel_id == "narration":
+            print(f"🔌 Narration channel received for peer {peer_id}")
+
+            @channel.on("open")
+            def on_narration_open():
+                print(f"🔌 Narration channel opened for peer {peer_id}")
+
+            @channel.on("message")
+            def on_narration_message(message):
+                asyncio.create_task(on_message(channel, message))
+        else:
+            @channel.on("message")
+            def on_channel_message(message):
+                asyncio.create_task(on_message(channel, message))
 
     recorder = MediaBlackhole()
 
