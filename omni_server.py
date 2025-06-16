@@ -50,19 +50,19 @@ from transformers import AutoModel, AutoTokenizer
 
 # ─── Model initialisation ────────────────────────────────────────────────
 logging.getLogger("torch").setLevel(logging.ERROR)
-print("🔄 Loading MiniCPM-o-2_6 omni model…", flush=True)
-model = AutoModel.from_pretrained(
-    "openbmb/MiniCPM-o-2_6",
-    trust_remote_code=True,
-    attn_implementation="sdpa",
-    torch_dtype=torch.bfloat16,
-    init_vision=True,
-    init_audio=True,
-    init_tts=True,
-).eval().cuda()
+print("🔄 Loading MiniCPM-o-2_6 model…", flush=True)
 
+# Use the simple GitHub implementation
+model = AutoModel.from_pretrained(
+    'openbmb/MiniCPM-o-2_6',
+    trust_remote_code=True,
+    attn_implementation='sdpa',
+    torch_dtype=torch.bfloat16
+)
+model = model.eval().cuda()
 tokenizer = AutoTokenizer.from_pretrained(
-    "openbmb/MiniCPM-o-2_6", trust_remote_code=True)
+    'openbmb/MiniCPM-o-2_6', trust_remote_code=True)
+
 print("✅ Model loaded", flush=True)
 
 # ─── Global state management ───────────────────────────────────────────────
@@ -161,7 +161,7 @@ def cleanup_peer_data(peer_id: str):
 
 
 async def _process_frame_sync(sid: str, frames: List[Image.Image]):
-    """Blocking call that processes a batch of frames with MiniCPM-o and streams tokens.
+    """Process a batch of frames with MiniCPM-o and send response.
 
     Args:
         sid: Session ID for the peer
@@ -180,17 +180,15 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
 
     # Build context-aware prompt for multi-frame processing
     if last_narr:
-        prompt_text = (
-            "Continue narrating the video sequence while focusing on changes and movement. "
-            f"Previously you mentioned: '{last_narr}'. "
-            "Describe any new developments or changes in the scene."
+        question = (
+            f"Continue narrating this video sequence. Previously you mentioned: '{last_narr}'. "
+            "Describe any new developments or changes in the scene. Keep it brief (1-2 sentences)."
         )
         print(
             f"🔄 [DEBUG] Using continuation prompt with last narration: '{last_narr[:50]}...'")
     else:
-        prompt_text = (
-            "You are seeing a sequence of video frames. "
-            "Provide a concise narration of what's happening in the video. "
+        question = (
+            "Describe what's happening in this video sequence. "
             "Focus on movement, actions, and important changes. "
             "Keep it brief and descriptive (1-2 sentences)."
         )
@@ -219,96 +217,57 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
 
     print(f"✅ [DEBUG] Got open narration channel for peer {sid}")
 
-    full_response = ""
-
     try:
-        # 2. Prefill system prompt
-        print("🔄 [DEBUG] Prefilling system prompt...")
-        sys_msg = model.get_sys_prompt(mode='omni', language='en')
-        model.streaming_prefill(
-            session_id=sid,
-            msgs=[sys_msg],
-            tokenizer=tokenizer
-        )
+        # Prepare messages for the model (using GitHub implementation format)
+        msgs = [
+            {'role': 'user', 'content': frames + [question]},
+        ]
 
-        # 3. Prefill user message with frames
-        print(
-            f"🔄 [DEBUG] Prefilling user message with {len(frames)} frames...")
-        user_msg = {
-            'role': 'user',
-            'content': [*frames, prompt_text]
-        }
-        model.streaming_prefill(
-            session_id=sid,
-            msgs=[user_msg],
-            tokenizer=tokenizer
-        )
+        # Set decode params for video
+        params = {}
+        params["use_image_id"] = False
+        # use 1 if cuda OOM and video resolution > 448*448
+        params["max_slice_nums"] = 2
 
-        # 4. Stream generate tokens
-        print("🔄 [DEBUG] Starting token generation...")
-        response_stream = model.streaming_generate(
-            session_id=sid,
+        print("🔄 [DEBUG] Running model.chat()...")
+
+        # Use the simple chat method from GitHub implementation
+        answer = model.chat(
+            msgs=msgs,
             tokenizer=tokenizer,
-            temperature=0.2,
-            max_new_tokens=100,
+            **params
         )
 
-        # Process streaming response
-        print("🔄 [DEBUG] Streaming tokens to client...")
-        for token_data in response_stream:
-            if isinstance(token_data, dict):
-                # Handle text tokens
-                token = token_data.get('text', '')
-                if not token:
-                    continue
+        print(f"🔄 [DEBUG] Model response: '{answer}'")
 
-                full_response += token
-
-                # Send token to client
-                message = {
-                    'type': 'token',
-                    'token': token,
-                    'is_final': False
-                }
-
-                if narration_channel.readyState == "open":
-                    try:
-                        narration_channel.send(json.dumps(message))
-                        print(f"📤 [DEBUG] Sent token: '{token}'", flush=True)
-                    except Exception as e:
-                        print(f"⚠️ [ERROR] Error sending token: {str(e)}")
-
-        # Send completion message after all tokens have been processed
-        if full_response.strip():
-            completion_message = {
+        if answer and answer.strip():
+            # Send complete response directly (no word-by-word streaming)
+            complete_message = {
                 'type': 'complete',
-                'full_text': full_response.strip(),
+                'full_text': answer.strip(),
                 'is_final': True
             }
+
             if narration_channel.readyState == "open":
                 try:
-                    narration_channel.send(json.dumps(completion_message))
+                    narration_channel.send(json.dumps(complete_message))
                     print(
-                        f"✅ [DEBUG] Streaming complete: '{full_response.strip()}'")
+                        f"✅ [DEBUG] Sent complete response: '{answer.strip()}'")
                 except Exception as e:
                     print(
-                        f"⚠️ [ERROR] Error sending completion message: {str(e)}")
+                        f"⚠️ [ERROR] Error sending complete response: {str(e)}")
 
             # Update last narration for context
-            last_narration_per_client[sid] = full_response.strip()
+            last_narration_per_client[sid] = answer.strip()
             print(f"✅ [DEBUG] Updated last narration for peer {sid}")
 
-            return full_response.strip()
+            return answer.strip()
         else:
+            print("⚠️ [DEBUG] No response generated")
             return None
 
     except Exception as e:
-        print(f"⚠️ [ERROR] Error during streaming generation: {str(e)}")
-        try:
-            model.reset_session()
-        except Exception as cleanup_error:
-            print(
-                f"⚠️ [ERROR] Error cleaning up session: {str(cleanup_error)}")
+        print(f"⚠️ [ERROR] Error during model inference: {str(e)}")
         try:
             narration_channel = global_data_channels.get(
                 sid, {}).get("narration")
@@ -366,6 +325,9 @@ async def on_message(channel: RTCDataChannel, message: str):
         elif msg_type == 'end_stream':
             # Handle stream end request
             await handle_end_stream(channel, data)
+        elif msg_type == 'question':
+            # Handle question request
+            await handle_question(channel, data)
         else:
             print(f"⚠️ [DEBUG] Unknown message type: {msg_type}")
 
