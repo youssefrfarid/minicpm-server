@@ -348,17 +348,15 @@ async def offer(request: Request):
     pc.id = peer_id  # Assign the peer_id to the connection object
     pcs[peer_id] = pc
     
-    # Create data channel for narration before setting up video
-    narration_channel = pc.createDataChannel("narration")
-    if peer_id not in global_data_channels:
-        global_data_channels[peer_id] = {}
-    global_data_channels[peer_id]["narration"] = narration_channel
-    print(f"🔌 Created narration data channel for peer {peer_id}")
+
     
     # Handle any additional data channels created by the client
     @pc.on("datachannel")
     def on_datachannel(channel):
         channel_id = channel.label
+        # Ensure peer dictionary exists now that the first data channel arrived
+        if peer_id not in global_data_channels:
+            global_data_channels[peer_id] = {}
         if channel_id == "narration":
             print(f"🔌 Client-created narration channel for peer {peer_id}")
             # Update our reference to use the client-created channel
