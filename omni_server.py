@@ -121,7 +121,7 @@ def _process_frame_sync(sid: str, frames: List[Image.Image]):
         print("🔄 [DEBUG] Using initial prompt (no previous narration)")
 
     # Get or create data channel for this peer
-    narration_channel = global_data_channels.get(f"{sid}_narration")
+    narration_channel = global_data_channels.get(sid, {}).get("narration")
     if not narration_channel:
         print(f"⚠️ [DEBUG] No narration channel found for peer {sid}")
         return None
@@ -338,14 +338,24 @@ async def offer(request: Request):
     pc.id = peer_id  # Assign the peer_id to the connection object
     pcs[peer_id] = pc
     
-    # Handle data channel creation
+    # Create data channel for narration before setting up video
+    narration_channel = pc.createDataChannel("narration")
+    if peer_id not in global_data_channels:
+        global_data_channels[peer_id] = {}
+    global_data_channels[peer_id]["narration"] = narration_channel
+    print(f"🔌 Created narration data channel for peer {peer_id}")
+    
+    # Handle any additional data channels created by the client
     @pc.on("datachannel")
     def on_datachannel(channel):
         channel_id = channel.label
-        print(f"🔌 New data channel {channel_id} for peer {peer_id}")
-        if peer_id not in global_data_channels:
-            global_data_channels[peer_id] = {}
-        global_data_channels[peer_id][channel_id] = channel
+        if channel_id == "narration":
+            print(f"🔌 Client-created narration channel for peer {peer_id}")
+            # Update our reference to use the client-created channel
+            global_data_channels[peer_id]["narration"] = channel
+        else:
+            print(f"🔌 New data channel {channel_id} for peer {peer_id}")
+            global_data_channels[peer_id][channel_id] = channel
         
         @channel.on("message")
         def on_message(message):
