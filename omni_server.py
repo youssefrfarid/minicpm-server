@@ -86,7 +86,7 @@ def get_peer_id_from_channel(channel: RTCDataChannel) -> str:
     return f"peer_{id(channel)}"
 
 
-def _process_frame_sync(sid: str, frames: List[Image.Image]):
+async def _process_frame_sync(sid: str, frames: List[Image.Image]):
     """Blocking call that processes a batch of frames with MiniCPM-o and streams tokens.
     
     Args:
@@ -120,15 +120,26 @@ def _process_frame_sync(sid: str, frames: List[Image.Image]):
         )
         print("🔄 [DEBUG] Using initial prompt (no previous narration)")
 
-    # Get or create data channel for this peer
-    narration_channel = global_data_channels.get(sid, {}).get("narration")
+    # Wait for narration channel to be ready (with timeout)
+    max_wait = 5.0  # seconds
+    start_time = time.time()
+    narration_channel = None
+    
+    while time.time() - start_time < max_wait:
+        narration_channel = global_data_channels.get(sid, {}).get("narration")
+        if narration_channel and narration_channel.readyState == "open":
+            break
+        await asyncio.sleep(0.1)  # Small delay to prevent busy waiting
+    
     if not narration_channel:
-        print(f"⚠️ [DEBUG] No narration channel found for peer {sid}")
+        print(f"⚠️ [DEBUG] No narration channel found for peer {sid} after {max_wait} seconds")
         return None
     
     if narration_channel.readyState != "open":
-        print(f"⚠️ [DEBUG] Narration channel not open for peer {sid}")
+        print(f"⚠️ [DEBUG] Narration channel not open for peer {sid} after {max_wait} seconds")
         return None
+        
+    print(f"✅ [DEBUG] Got open narration channel for peer {sid}")
     
     full_response = ""
     
@@ -240,24 +251,23 @@ def _process_frame_sync(sid: str, frames: List[Image.Image]):
 
 
 async def process_frame(sid: str, frames: List[Image.Image]):
-    """Process a batch of frames and handle streaming in thread pool.
+    """Process a batch of frames and handle streaming.
     
     Args:
         sid: Session ID for the peer
         frames: List of PIL Images to process as a batch
     """
-    if not frames:
-        print("⚠️ [DEBUG] No frames provided to process_frame")
-        return None
-        
     print(f"🎬 [DEBUG] process_frame called for peer {sid} with {len(frames)} frames")
+    print(f"🎬 [DEBUG] Starting batch streaming inference...")
     
-    # Run streaming inference in thread pool (data channel sends happen inside)
-    print(f"🎬 [DEBUG] Starting batch streaming inference in thread pool...")
-    result = await asyncio.to_thread(_process_frame_sync, sid, frames)
-    print(f"🎬 [DEBUG] Batch streaming inference completed, result: {'Success' if result else 'Skipped/None'}")
-    
-    return result
+    try:
+        # Directly await the async _process_frame_sync
+        result = await _process_frame_sync(sid, frames)
+        print(f"🎬 [DEBUG] Batch streaming inference completed, result: {'Success' if result else 'Skipped/None'}")
+        return result
+    except Exception as e:
+        print(f"🎬 [ERROR] Error in batch processing: {str(e)}")
+        return None
 
 # ─── WebRTC signalling & media ingestion ───────────────────────────────
 app = FastAPI()
