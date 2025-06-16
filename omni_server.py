@@ -42,7 +42,7 @@ import cv2
 from PIL import Image
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
-from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack, RTCDataChannel
+from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack, RTCDataChannel, MediaStreamError
 from aiortc.contrib.media import MediaBlackhole
 
 import torch
@@ -69,6 +69,7 @@ print("✅ Model loaded", flush=True)
 # Global stores for peer connections and data channels
 pcs: Dict[str, RTCPeerConnection] = {}
 global_data_channels: Dict[str, Dict[str, RTCDataChannel]] = {}
+global_peer_data: Dict[str, Dict] = {}  # For storing peer-specific data
 last_narration_per_client: Dict[str, str] = {}
 previous_frame_per_client: Dict[str, Optional[Image.Image]] = {}
 
@@ -84,279 +85,177 @@ def get_peer_id_from_channel(channel: RTCDataChannel) -> str:
     """Extract peer ID from data channel."""
     return f"peer_{id(channel)}"
 
-def _decode_image_from_base64(image_b64: str) -> Optional[Image.Image]:
-    try:
-        data = base64.b64decode(image_b64)
-        img_arr = cv2.imdecode(cv2.UMat(data).get(), cv2.IMREAD_COLOR)
-        if img_arr is None:
-            return None
-        img_arr = cv2.resize(img_arr, (320, 320), interpolation=cv2.INTER_AREA)
-        img_rgb = cv2.cvtColor(img_arr, cv2.COLOR_BGR2RGB)
-        return Image.fromarray(img_rgb)
-    except Exception as exc:
-        print(f"Image decode error: {exc}")
+
+def _process_frame_sync(sid: str, frames: List[Image.Image]):
+    """Blocking call that processes a batch of frames with MiniCPM-o and streams tokens.
+    
+    Args:
+        sid: Session ID for the peer
+        frames: List of PIL Images to process as a batch (should be in chronological order)
+    """
+    if not frames:
+        print("⚠️ [DEBUG] No frames provided to _process_frame_sync")
         return None
-
-
-def _compute_frame_similarity(img1: Image.Image, img2: Image.Image) -> float:
-    """Compute similarity between two PIL Images using histograms."""
-    try:
-        # Convert to numpy arrays for faster processing
-        arr1 = np.array(img1.resize((64, 64)))  # Resize for speed
-        arr2 = np.array(img2.resize((64, 64)))
         
-        # Compute histogram correlation
-        hist1 = np.histogram(arr1.flatten(), bins=50)[0]
-        hist2 = np.histogram(arr2.flatten(), bins=50)[0]
-        
-        # Normalize histograms
-        hist1 = hist1 / np.sum(hist1)
-        hist2 = hist2 / np.sum(hist2)
-        
-        # Compute correlation coefficient
-        correlation = np.corrcoef(hist1, hist2)[0, 1]
-        return correlation if not np.isnan(correlation) else 0.0
-    except Exception as e:
-        print(f"Error computing frame similarity: {e}")
-        return 0.0
-
-
-def _process_frame_sync(sid: str, curr_img: Image.Image, prev_img: Optional[Image.Image]):
-    """Blocking call that interacts with MiniCPM-o and returns streaming tokens."""
-    print(f"🔄 [DEBUG] Starting inference for peer {sid}")
-    print(f"🔄 [DEBUG] Current image size: {curr_img.size}")
-    print(f"🔄 [DEBUG] Previous image: {'Available' if prev_img else 'None'}")
+    print(f"🔄 [DEBUG] Starting batch inference for peer {sid} with {len(frames)} frames")
+    print(f"🔄 [DEBUG] Frame dimensions: {frames[0].size if frames else 'N/A'}")
     
-    # Skip processing if frames are too similar (static scene)
-    if prev_img is not None:
-        similarity = _compute_frame_similarity(curr_img, prev_img)
-        print(f"🔄 [DEBUG] Frame similarity: {similarity:.3f}")
-        if similarity > 0.95:  # 95% similar = skip processing
-            print(f"⏭️ [DEBUG] Frames too similar ({similarity:.3f}), skipping inference")
-            return None
-    
+    # Get last narration for context
     last_narr = last_narration_per_client.get(sid, "")
     
-    # Build context-aware prompt
+    # Build context-aware prompt for multi-frame processing
     if last_narr:
         prompt_text = (
-            "Continue narrating while ignoring static background details. "
-            f"Previously you said: '{last_narr}'. What is happening now?"
+            "Continue narrating the video sequence while focusing on changes and movement. "
+            f"Previously you mentioned: '{last_narr}'. "
+            "Describe any new developments or changes in the scene."
         )
         print(f"🔄 [DEBUG] Using continuation prompt with last narration: '{last_narr[:50]}...'")
     else:
         prompt_text = (
-            "Focus on the main subjects and their actions. Ignore static "
-            "background details. What's happening now?"
+            "You are seeing a sequence of video frames. "
+            "Provide a concise narration of what's happening in the video. "
+            "Focus on movement, actions, and important changes. "
+            "Keep it brief and descriptive (1-2 sentences)."
         )
-        print(f"🔄 [DEBUG] Using initial prompt (no previous narration)")
+        print("🔄 [DEBUG] Using initial prompt (no previous narration)")
 
-    # Use official MiniCPM-o-2.6 API format with system instruction
-    msgs = [
-        {
-            'role': 'system', 
-            'content': [
-                "You are a live video narration assistant for visually impaired users. "
-                "Provide concise, real-time descriptions of what's happening in the video. "
-                "Focus on movement, actions, and important changes. "
-                "Ignore static backgrounds and irrelevant details. "
-                "Keep responses to 1-2 sentences maximum. "
-                "Be descriptive but brief."
-            ]
-        },
-        {
-            'role': 'user', 
-            'content': [curr_img, prompt_text]
-        }
-    ]
+    # Get or create data channel for this peer
+    narration_channel = global_data_channels.get(f"{sid}_narration")
+    if not narration_channel:
+        print(f"⚠️ [DEBUG] No narration channel found for peer {sid}")
+        return None
     
-    # Add previous frame for better context if available
-    if prev_img is not None:
-        msgs[1]['content'].insert(-1, prev_img)  # Add prev_img before prompt_text
-        print(f"🔄 [DEBUG] Added previous frame to message")
+    if narration_channel.readyState != "open":
+        print(f"⚠️ [DEBUG] Narration channel not open for peer {sid}")
+        return None
     
-    print(f"🔄 [DEBUG] Calling model streaming with {len(msgs)} messages...")
+    full_response = ""
     
     try:
-        # Wait for narration channel to be available (max 5 seconds)
-        max_attempts = 10
-        wait_time = 0.5  # seconds per attempt
-        attempts = 0
-        narration_channel = None
-
-        while attempts < max_attempts:
-            # Get the data channel for narration output from global storage
-            peer_channels = global_data_channels.get(sid, {})
-            narration_channel = peer_channels.get('narration')
-            
-            if narration_channel:
-                print(f"✅ [DEBUG] Narration channel found for peer {sid} after {attempts * wait_time:.1f}s")
-                break
-            
-            print(f"⚠️ [DEBUG] Waiting for narration channel to be ready for peer {sid}, attempt {attempts+1}/{max_attempts}")
-            attempts += 1
-            time.sleep(wait_time)
+        # 1. Reset session for this peer
+        print(f"🔄 [DEBUG] Resetting session for peer {sid}")
+        model.reset_session(session_id=sid)
         
-        if not narration_channel:
-            print(f"❌ [DEBUG] No narration channel found for peer {sid} after {max_attempts * wait_time:.1f}s")
-            return None
+        # 2. Prefill system prompt
+        print("🔄 [DEBUG] Prefilling system prompt...")
+        sys_msg = model.get_sys_prompt(mode='omni', language='en')
+        model.streaming_prefill(
+            session_id=sid,
+            msgs=[sys_msg],
+            tokenizer=tokenizer
+        )
         
-        # Try to use streaming if available, otherwise fall back to chat
-        try:
-            # Add additional parameters to model to fix the streaming issues
-            print(f"🔄 [DEBUG] Attempting streaming_generate with additional parameters")
-            response_stream = model.streaming_generate(
-                msgs=msgs,
-                tokenizer=tokenizer,
-                session_id=sid,
-                max_new_tokens=100,
-                temperature=0.2,
-                repetition_penalty=1.05,
-                eos_token_id=tokenizer.eos_token_id,  # Add EOS token ID explicitly
-                device=model.device                    # Ensure device is correctly set
-            )
-            
-            if response_stream is None:
-                raise ValueError("Streaming API returned None")
+        # 3. Prefill user message with frames
+        print(f"🔄 [DEBUG] Prefilling user message with {len(frames)} frames...")
+        user_msg = {
+            'role': 'user',
+            'content': [*frames, prompt_text]
+        }
+        model.streaming_prefill(
+            session_id=sid,
+            msgs=[user_msg],
+            tokenizer=tokenizer
+        )
+        
+        # 4. Stream generate tokens
+        print("🔄 [DEBUG] Starting token generation...")
+        response_stream = model.streaming_generate(
+            session_id=sid,
+            tokenizer=tokenizer,
+            temperature=0.2,
+            max_new_tokens=100,
+            repetition_penalty=1.05,
+            eos_token_id=tokenizer.eos_token_id,
+            device=model.device,
+            omni_input=True
+        )
+        
+        # Process streaming response
+        print("🔄 [DEBUG] Streaming tokens to client...")
+        for token_data in response_stream:
+            if isinstance(token_data, dict):
+                # Handle text tokens
+                token = token_data.get('text', '')
+                if not token:
+                    continue
+                    
+                full_response += token
                 
-            print(f"🔄 [DEBUG] Using streaming_generate for real-time tokens")
-            full_response = ""
+                # Send token to client
+                message = {
+                    'type': 'token',
+                    'token': token,
+                    'is_final': False
+                }
+                
+                if narration_channel.readyState == "open":
+                    try:
+                        narration_channel.send(json.dumps(message))
+                        print(f"📤 [DEBUG] Sent token: {token}", end='', flush=True)
+                    except Exception as e:
+                        print(f"⚠️ [ERROR] Error sending token: {str(e)}")
+                
+                full_response += token
             
-            # Stream tokens as they're generated - more defensively
-            try:
-                for token_data in response_stream:
-                    # Debug the token data structure
-                    print(f"🔄 [DEBUG] Token data type: {type(token_data).__name__}")
-                    
-                    # Extract token based on data type
-                    token = None
-                    if isinstance(token_data, dict) and 'token' in token_data:
-                        token = token_data['token']
-                    elif isinstance(token_data, dict) and 'text' in token_data:
-                        token = token_data['text']
-                    elif isinstance(token_data, str):
-                        token = token_data
-                    else:
-                        print(f"🔄 [DEBUG] Unknown token format: {token_data}")
-                        continue
-                    
-                    # Clean token
-                    cleaned_token = (
-                        token.replace("<|audio_sep|>", "")
-                        .replace("<|tts_eos|>", "")
-                        .replace("<|tts|>", "")
-                    )
-                    
-                    if cleaned_token.strip():
-                        full_response += cleaned_token
-                        
-                        # Send token immediately
-                        message = {
-                            "type": "narration",
-                            "token": cleaned_token,
-                            "is_end": False
-                        }
-                        if narration_channel.readyState == "open":
-                            narration_channel.send(json.dumps(message))
-                        print(f"🔄 [DEBUG] Streamed token: '{cleaned_token}'")
-            except Exception as e:
-                print(f"⚠️ [DEBUG] Error processing streaming tokens: {e}")
-                raise
-            
-            # Send completion
+            # Send completion message if we have a response
             if full_response.strip():
-                # Send final narration token with is_end=true for streaming case
                 completion_message = {
-                    "type": "narration",
-                    "token": full_response.strip(),
-                    "is_end": True
+                    'type': 'complete',
+                    'full_text': full_response.strip(),
+                    'is_final': True
                 }
                 if narration_channel.readyState == "open":
                     narration_channel.send(json.dumps(completion_message))
-                    
-                last_narration_per_client[sid] = full_response.strip()
+                
                 print(f"✅ [DEBUG] Streaming complete: '{full_response.strip()}'")
+                
+                # Update last narration for context
+                last_narration_per_client[sid] = full_response.strip()
+                print(f"✅ [DEBUG] Updated last narration for peer {sid}")
+                
                 return full_response.strip()
             
-        except (AttributeError, TypeError) as streaming_error:
-            print(f"⚠️ [DEBUG] Streaming not available ({streaming_error}), falling back to chat")
+            return None
             
-            # Fallback to regular chat method
-            response = model.chat(
-                msgs=msgs,
-                tokenizer=tokenizer,
-                session_id=sid,
-                max_new_tokens=100,
-                temperature=0.2,
-                do_sample=True
-            )
-            
-            print(f"🔄 [DEBUG] Raw model response: '{response}'")
-            
-            # Clean up response tokens
-            if response:
-                cleaned_response = (
-                    response.replace("<|audio_sep|>", "")
-                    .replace("<|tts_eos|>", "")
-                    .replace("<|tts|>", "")
-                    .strip()
-                )
-                
-                print(f"🔄 [DEBUG] Cleaned response: '{cleaned_response}'")
-                
-                if cleaned_response:
-                    # Send complete response immediately (not word by word)
-                    message = {
-                        "type": "narration",
-                        "token": cleaned_response,
-                        "is_end": True
-                    }
-                    if narration_channel.readyState == "open":
-                        narration_channel.send(json.dumps(message))
-                    
-                    completion_message = {
-                        "type": "narration_complete",
-                        "full_text": cleaned_response
-                    }
-                    if narration_channel.readyState == "open":
-                        narration_channel.send(json.dumps(completion_message))
-                    
-                    last_narration_per_client[sid] = cleaned_response
-                    print(f"✅ [DEBUG] Sent complete response: '{cleaned_response}'")
-                    return cleaned_response
-        
-        return None
-        
     except Exception as e:
-        print(f"❌ [DEBUG] Error in MiniCPM-o inference: {e}")
-        print(f"❌ [DEBUG] Exception type: {type(e)}")
-        import traceback
-        traceback.print_exc()
-        
-        # Send error via data channel
-        peer_channels = global_data_channels.get(sid, {})
-        narration_channel = peer_channels.get('narration')
-        if narration_channel and narration_channel.readyState == "open":
-            try:
+        print(f"⚠️ [ERROR] Error during streaming generation: {str(e)}")
+        try:
+            model.reset_session(session_id=sid)
+        except Exception as cleanup_error:
+            print(f"⚠️ [ERROR] Error cleaning up session: {str(cleanup_error)}")
+        try:
+            narration_channel = global_data_channels.get(f"{sid}_narration")
+            if narration_channel and narration_channel.readyState == "open":
                 error_message = {
                     "type": "error",
-                    "message": f"Inference error: {str(e)}"
+                    "message": f"Error processing video: {str(e)}",
+                    "is_final": True
                 }
                 narration_channel.send(json.dumps(error_message))
-            except Exception as channel_err:
-                print(f"❌ [DEBUG] Error sending to data channel: {channel_err}")
+        except Exception as send_error:
+            print(f"⚠️ [ERROR] Failed to send error message: {send_error}")
         
-        return f"ERROR: {str(e)}"
+        return None
 
 
-async def process_frame(sid: str, curr_img: Image.Image, prev_img: Optional[Image.Image]):
-    """Process frame and handle streaming in thread pool."""
-    print(f"🎬 [DEBUG] process_frame called for peer {sid}")
+async def process_frame(sid: str, frames: List[Image.Image]):
+    """Process a batch of frames and handle streaming in thread pool.
+    
+    Args:
+        sid: Session ID for the peer
+        frames: List of PIL Images to process as a batch
+    """
+    if not frames:
+        print("⚠️ [DEBUG] No frames provided to process_frame")
+        return None
+        
+    print(f"🎬 [DEBUG] process_frame called for peer {sid} with {len(frames)} frames")
     
     # Run streaming inference in thread pool (data channel sends happen inside)
-    print(f"🎬 [DEBUG] Starting streaming inference in thread pool...")
-    result = await asyncio.to_thread(_process_frame_sync, sid, curr_img, prev_img)
-    print(f"🎬 [DEBUG] Streaming inference completed, result: {'Success' if result else 'Skipped/None'}")
+    print(f"🎬 [DEBUG] Starting batch streaming inference in thread pool...")
+    result = await asyncio.to_thread(_process_frame_sync, sid, frames)
+    print(f"🎬 [DEBUG] Batch streaming inference completed, result: {'Success' if result else 'Skipped/None'}")
     
     return result
 
@@ -378,9 +277,6 @@ async def on_message(channel: RTCDataChannel, message: str):
         elif msg_type == 'end_stream':
             # Handle stream end request
             await handle_end_stream(channel, data)
-        elif msg_type == 'question':
-            # Handle user questions
-            await handle_question(channel, data)
         else:
             print(f"⚠️ [DEBUG] Unknown message type: {msg_type}")
             
@@ -430,26 +326,6 @@ async def handle_end_stream(channel: RTCDataChannel, data: Dict[str, Any]):
     except Exception as e:
         print(f"❌ [DEBUG] Error in handle_end_stream: {e}")
 
-
-async def handle_question(channel: RTCDataChannel, data: Dict[str, Any]):
-    """Handle user questions about the current scene."""
-    try:
-        peer_id = get_peer_id_from_channel(channel)
-        question = data.get('question', '')
-        
-        print(f"❓ [DEBUG] Question from peer {peer_id}: {question}")
-        
-        # TODO: Implement question processing with current video frame
-        response = {
-            "type": "ack",
-            "message": f"Question received: {question}"
-        }
-        channel.send(json.dumps(response))
-        
-    except Exception as e:
-        print(f"❌ [DEBUG] Error in handle_question: {e}")
-
-
 @app.post("/offer")
 async def offer(request: Request):
     params = await request.json()
@@ -479,145 +355,45 @@ async def offer(request: Request):
 
     @pc.on("track")
     async def on_track(track):
-        """Handle incoming WebRTC media tracks."""
-        if track.kind == "video":
-            print(f"📺 Video track for peer {pc.id}")
+        """Handle incoming WebRTC video frames and process with MiniCPM."""
+        if track.kind != "video":
+            return
             
-            prev_img = None
-            prev_frame_data = None
-            frame_counter = 0
-            duplicate_frames = 0
-            start_time = time.time()
-            
+        print(f"📺 Video track received for peer {pc.id}")
+        frame_buffer = []
+        BATCH_SIZE = 10
+        
+        try:
             while True:
                 try:
+                    # Get next video frame
                     frame = await track.recv()
-                    # Get timestamp for FPS calculation
-                    timestamp = time.time()
                     
-                    # Store frame details for statistics
-                    global_peer_data.setdefault(pc.id, {}).setdefault('frames', []).append(timestamp)
-                    
+                    # Convert frame to RGB PIL Image
                     bgr = frame.to_ndarray(format="bgr24")
-                    bgr = cv2.resize(bgr, (320, 320), interpolation=cv2.INTER_AREA)
                     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                except aiortc.mediastreams.MediaStreamError:
-                    # This is expected when the client disconnects
+                    rgb = cv2.resize(rgb, (384, 384))  # Increased size for better detail
+                    pil_img = Image.fromarray(rgb)
+                    
+                    # Add to buffer
+                    frame_buffer.append(pil_img)
+                    
+                    # Process batch when we have BATCH_SIZE frames
+                    if len(frame_buffer) >= BATCH_SIZE:
+                        # Process batch in background thread
+                        print(f"🔄 [DEBUG] Collected {len(frame_buffer)} frames, processing batch...")
+                        asyncio.create_task(process_frame(pc.id, frame_buffer.copy()))
+                        frame_buffer = []  # Clear buffer for next batch
+                        print(f"🔄 [DEBUG] Started processing batch for peer {pc.id}")
+                    
+                except MediaStreamError as e:
                     print(f"🔌 Video track ended for peer {pc.id}")
                     break
-                # Take sample points from frame to create a reliable signature
-                # We sample at multiple points to catch small movements
-                h, w, _ = bgr.shape
-                sample_points = [
-                    bgr[h//4, w//4].mean(),      # top-left quadrant
-                    bgr[h//4, 3*w//4].mean(),   # top-right quadrant
-                    bgr[h//2, w//2].mean(),     # center
-                    bgr[3*h//4, w//4].mean(),   # bottom-left quadrant
-                    bgr[3*h//4, 3*w//4].mean(), # bottom-right quadrant
-                ]
-                
-                # Create hash of sample points
-                frame_hash = hashlib.md5(str(sample_points).encode()).hexdigest()[:8]
-                
-                # Calculate frame difference if we have a previous frame
-                is_duplicate = False
-                if prev_frame_data is not None:
-                    # Calculate Mean Squared Error between frames
-                    if frame_counter % 30 == 0:
-                        frame_hash = hashlib.md5(rgb.tobytes()).hexdigest()
-                        if prev_frame_data == frame_hash:
-                            duplicate_frames += 1
-                        prev_frame_data = frame_hash
-                        
-                        # Report stats every 30 frames
-                        elapsed = ts - start_time
-                        fps = frame_counter / elapsed if elapsed > 0 else 0
-                        duplicate_pct = (duplicate_frames / frame_counter * 100) if frame_counter > 0 else 0
-                        print(f"WebRTC stats for {peer_id}: {frame_counter} frames in {elapsed:.1f}s "  
-                              f"({fps:.1f} FPS), {duplicate_pct:.1f}% duplicates")
-                
-                # Skip duplicate frames
-                if prev_img is not None:
-                    # Use point samples for quick similarity check
-                    if prev_frame_data == sample_points:
-                        continue
-                
-                # Get the data channel for narration output from global storage
-                peer_channels = global_data_channels.get(peer_id, {})
-                narration_channel = peer_channels.get('narration')
-                
-                # Process this frame (generates narration) and send via data channel
-                rgb_pil = Image.fromarray(rgb)
-                
-                # Process frame with the narration channel
-                last_narration = last_narration_per_client.get(peer_id, "")
-                if prev_img is None or _compute_frame_similarity(prev_img, rgb_pil) < 0.95:  # Skip very similar frames
-                    # Proper async call to run MiniCPM in thread
-                    narration = await process_frame(peer_id, rgb_pil, prev_img)
                     
-                    # Only send if the narration has changed
-                    if narration and narration != last_narration:
-                        # Send chunks for better real-time experience
-                        if len(narration) > 80:
-                            words = narration.split()
-                            chunks = []
-                            current = []
-                            total = 0
-                            
-                            # Break into ~50 char chunks on word boundaries 
-                            for word in words:
-                                if total + len(word) + 1 > 50 and current:
-                                    chunks.append(" ".join(current))
-                                    current = [word]
-                                    total = len(word)
-                                else:
-                                    current.append(word)
-                                    total += len(word) + 1
-                            if current:
-                                chunks.append(" ".join(current))
-                            
-                            # Send chunks with is_end flag on the last one
-                            for i, chunk in enumerate(chunks):
-                                is_last = i == len(chunks) - 1
-                                message = {
-                                    "type": "narration",
-                                    "token": chunk,
-                                    "is_end": is_last
-                                }
-                                
-                                # Send through data channel if available
-                                if narration_channel:
-                                    try:
-                                        if narration_channel.readyState == "open":
-                                            narration_channel.send(json.dumps(message))
-                                    except Exception as e:
-                                        print(f"Error sending via data channel: {e}")
-                                        # No WebSocket fallback here - this is pure WebRTC
-                                
-                                await asyncio.sleep(0.1)  # Slight delay between chunks 
-                        else:
-                            message = {
-                                "type": "narration",
-                                "token": narration,
-                                "is_end": True
-                            }
-                            
-                            # Send through data channel if available
-                            if narration_channel:
-                                try:
-                                    if narration_channel.readyState == "open":
-                                        narration_channel.send(json.dumps(message))
-                                except Exception as e:
-                                    print(f"Error sending via data channel: {e}")
-                        
-                        last_narration_per_client[peer_id] = narration
-                
-                prev_img = rgb_pil
-                prev_frame_data = sample_points
-                
-        elif track.kind == "audio":
-            await recorder.start()
-            track.add_sink(recorder)
+        except Exception as e:
+            print(f"Error in video track processing: {e}")
+        finally:
+            print(f"Video processing ended for peer {pc.id}")
 
     @pc.on("connectionstatechange")
     async def on_state_change():
