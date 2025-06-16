@@ -222,10 +222,6 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
     full_response = ""
 
     try:
-        # 1. Reset session for this peer
-        print(f"🔄 [DEBUG] Resetting session for peer {sid}")
-        model.reset_session(session_id=sid)
-
         # 2. Prefill system prompt
         print("🔄 [DEBUG] Prefilling system prompt...")
         sys_msg = model.get_sys_prompt(mode='omni', language='en')
