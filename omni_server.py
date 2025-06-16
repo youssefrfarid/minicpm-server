@@ -441,7 +441,7 @@ async def offer(request: Request):
     global_data_channels[peer_id] = {}
 
     # Create narration data channel from server side
-    narration_channel = await pc.createDataChannel("narration")
+    narration_channel = pc.createDataChannel("narration")
     global_data_channels[peer_id]["narration"] = narration_channel
 
     @narration_channel.on("open")
