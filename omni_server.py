@@ -26,16 +26,10 @@ Notes:
 """
 from __future__ import annotations
 import asyncio
-import base64
 import logging
-import os
 import uuid
 import time
 import json
-import hashlib
-import numpy as np
-from collections import deque
-from io import BytesIO
 from typing import Dict, Optional, List, Any
 
 import cv2
@@ -83,8 +77,8 @@ MAX_VIDEO_HISTORY = 30  # tokens of history for each client
 # Frame batching system
 frame_buffers: Dict[str, List[Image.Image]] = {}
 batch_timers: Dict[str, asyncio.Task] = {}
-BATCH_SIZE = 3  # Smaller batch size for faster response
-BATCH_TIMEOUT = 2.0  # Process batch every 2 seconds max
+BATCH_SIZE = 60  # Smaller batch size for faster response
+BATCH_TIMEOUT = 10.0  # Process batch every 2 seconds max
 
 # ─── Helper functions ───────────────────────────────────────────────────
 
@@ -188,9 +182,11 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
             f"🔄 [DEBUG] Using continuation prompt with last narration: '{last_narr[:50]}...'")
     else:
         question = (
-            "Describe what's happening in this video sequence. "
+            "Describe what's happening to a blind person use phrases like You are looking at ... or You see ... "
+            "Mention any people interacting or facing the user."
             "Focus on movement, actions, and important changes. "
             "Keep it brief and descriptive (1-2 sentences)."
+            "Do not focus on the background."
         )
         print("🔄 [DEBUG] Using initial prompt (no previous narration)")
 
@@ -444,7 +440,7 @@ async def offer(request: Request):
                     bgr = frame.to_ndarray(format="bgr24")
                     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                     # Standard size for processing
-                    rgb = cv2.resize(rgb, (384, 384))
+                    rgb = cv2.resize(rgb, (512, 512))
                     pil_img = Image.fromarray(rgb)
 
                     # Add frame to batch processing system
