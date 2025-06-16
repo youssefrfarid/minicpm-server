@@ -77,7 +77,7 @@ MAX_VIDEO_HISTORY = 30  # tokens of history for each client
 # Frame batching system
 frame_buffers: Dict[str, List[Image.Image]] = {}
 batch_timers: Dict[str, asyncio.Task] = {}
-BATCH_SIZE = 60  # Smaller batch size for faster response
+BATCH_SIZE = 20  # Smaller batch size for faster response
 BATCH_TIMEOUT = 10.0  # Process batch every 2 seconds max
 
 # ─── Helper functions ───────────────────────────────────────────────────
@@ -440,7 +440,7 @@ async def offer(request: Request):
                     bgr = frame.to_ndarray(format="bgr24")
                     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                     # Standard size for processing
-                    rgb = cv2.resize(rgb, (512, 512))
+                    rgb = cv2.resize(rgb, (384, 384))
                     pil_img = Image.fromarray(rgb)
 
                     # Add frame to batch processing system
