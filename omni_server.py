@@ -79,8 +79,8 @@ MAX_VIDEO_HISTORY = 30  # tokens of history for each client
 # Real-time frame processing system
 frame_buffers: Dict[str, List[Image.Image]] = {}
 narration_loops: Dict[str, asyncio.Task] = {}
-MAX_FRAMES_IN_BATCH = 5  # Max frames to hold, ensuring we only process the latest
-NARRATION_INTERVAL = 1.0  # Seconds between narration attempts
+MAX_FRAMES_IN_BATCH = 12  # More frames for better temporal context
+NARRATION_INTERVAL = 1.5  # Slightly longer interval to accumulate more frames
 
 
 # For FPS calculation
@@ -171,16 +171,19 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
     if last_narr:
         question = (
             f"Continue narrating for a visually impaired person. Last, you said: '{last_narr}'. "
-            "Describe only the newest, most important change in one extremely short sentence. "
-            "For example: 'The person is now walking away.' Do not repeat previous information."
+            "Look carefully at these frames in sequence and describe any new movement, change in position, "
+            "new objects appearing, or different actions in one very short sentence. "
+            "If nothing has genuinely changed, you may say 'No change detected.' "
+            "Examples: 'The person moves to the left.' or 'A cup appears on the table.'"
         )
         print(
             f"🔄 [DEBUG] Using continuation prompt with last narration: '{last_narr[:50]}...'")
     else:
         question = (
-            "You are a scene narrator for a visually impaired person. Describe the most prominent object or action in a single, very short sentence. "
-            "For example: 'You are looking at a desk with a model airplane.' or 'A person is waving at you.' "
-            "Be extremely concise."
+            "You are a scene narrator for a visually impaired person. Look at these video frames and describe "
+            "the most prominent object or action in a one or two very short sentence. "
+            "Focus on what's most important or interesting in the scene. "
+            "Examples: 'You are looking at a desk with a laptop.' or 'A person is holding a blue phone.'"
         )
         print("🔄 [DEBUG] Using initial prompt (no previous narration)")
 
@@ -429,7 +432,8 @@ async def offer(request: Request):
         # Start the narration loop for this peer
         if peer_id not in narration_loops:
             loop = asyncio.get_event_loop()
-            narration_loops[peer_id] = loop.create_task(narration_loop(peer_id))
+            narration_loops[peer_id] = loop.create_task(
+                narration_loop(peer_id))
             print(f"✅ [DEBUG] Started narration loop for peer {peer_id}")
 
         try:
@@ -440,8 +444,8 @@ async def offer(request: Request):
                     frame_counter[peer_id] += 1
                     track_frame_counter += 1
 
-                    # Skip frames to reduce processing load (process every 3rd frame)
-                    if track_frame_counter % 3 != 0:
+                    # Skip frames to reduce processing load (process every 2nd frame)
+                    if track_frame_counter % 2 != 0:
                         continue
 
                     # Log FPS periodically
