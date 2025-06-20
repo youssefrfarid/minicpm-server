@@ -174,18 +174,20 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
         question = (
             f"You are describing what a visually impaired person is currently seeing. "
             f"Previously you mentioned: '{last_narr}'. "
-            "Now describe what is currently visible in the scene in one clear, short sentence. "
-            "Focus on the most prominent objects, people, or activities. "
-            "Examples: 'You are looking at a laptop on a wooden desk.' or 'A person is sitting in a chair.'"
+            "Now describe what they are looking at in conversational language. "
+            "Include any people or objects directly in front of the camera - avoid background scene details. "
+            "Use phrases like 'You are looking at...', 'There is... in front of you', 'The person in front is...' "
+            "Examples: 'You are looking at a laptop and coffee mug' or 'There is a person typing in front of you' or 'The person in front is holding a phone.'"
         )
         print(
             f"🔄 [DEBUG] Using continuation prompt with last narration: '{last_narr[:50]}...'")
     else:
         question = (
             "You are describing what a visually impaired person is currently seeing. "
-            "Describe the main objects, people, or scene in one clear, short sentence. "
-            "Focus on what would be most helpful for navigation and understanding. "
-            "Examples: 'You are looking at a kitchen counter with a coffee mug.' or 'A desk with a computer and papers.'"
+            "Describe what they are looking at using conversational language in one short sentence. "
+            "Include any people or objects directly in front of the camera - avoid background scene details. "
+            "Use phrases like 'You are looking at...', 'There is... in front of you', 'The person in front is...' "
+            "Examples: 'You are looking at a wooden desk with papers' or 'There is a person sitting nearby' or 'You are looking at someone's hands on a keyboard.'"
         )
         print("🔄 [DEBUG] Using initial prompt (no previous narration)")
 
