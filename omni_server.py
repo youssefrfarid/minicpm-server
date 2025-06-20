@@ -240,10 +240,10 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
         if answer and answer.strip():
             clean_answer = answer.strip()
 
-            # Take only the first sentence to keep it brief
+            # Limit to maximum of 3 sentences to keep it brief but descriptive
             sentences = re.split(r'(?<=[.!?])\s+', clean_answer)
-            if sentences:
-                clean_answer = sentences[0]
+            if len(sentences) > 3:
+                clean_answer = '. '.join(sentences[:3]) + '.'
 
             # Filter out unwanted static phrases
             static_phrases = ["static", "unchanged", "similar to before", "remains the same",
