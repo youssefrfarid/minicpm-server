@@ -31,6 +31,7 @@ import uuid
 import time
 import json
 from typing import Dict, Optional, List, Any
+from difflib import SequenceMatcher
 
 import cv2
 import numpy as np
@@ -87,9 +88,17 @@ frame_counter: Dict[str, int] = {}
 
 # Frame difference threshold
 FRAME_SIMILARITY_THRESHOLD = 1500  # MSE threshold to detect significant change
+TEXT_SIMILARITY_THRESHOLD = 0.85  # For comparing narration sentences
 
 
 # ─── Helper functions ───────────────────────────────────────────────────
+
+
+def are_texts_similar(a: str, b: str) -> bool:
+    """Compare two strings for similarity."""
+    if not a or not b:
+        return False
+    return SequenceMatcher(None, a, b).ratio() > TEXT_SIMILARITY_THRESHOLD
 
 
 def are_frames_different(frame1: np.ndarray, frame2: np.ndarray) -> bool:
@@ -102,7 +111,8 @@ def are_frames_different(frame1: np.ndarray, frame2: np.ndarray) -> bool:
     frame2_resized = cv2.resize(frame2, (128, 128))
 
     # Calculate MSE
-    mse = np.sum((frame1_resized.astype("float") - frame2_resized.astype("float")) ** 2)
+    mse = np.sum((frame1_resized.astype("float") -
+                 frame2_resized.astype("float")) ** 2)
     mse /= float(frame1_resized.shape[0] * frame1_resized.shape[1])
 
     return mse > FRAME_SIMILARITY_THRESHOLD
@@ -216,18 +226,17 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
     # Build context-aware prompt for multi-frame processing
     if last_narr:
         question = (
-            f"Continue narrating this video sequence. Previously you mentioned: '{last_narr}'. "
-            "Describe any new developments or changes in the scene. Keep it brief (1-2 sentences)."
+            f"Briefly describe what's new. Previously: '{last_narr}'. "
+            "Focus only on new actions or objects. Be very concise (max 1 sentence). "
+            "Do not mention if the scene is similar or static."
         )
         print(
             f"🔄 [DEBUG] Using continuation prompt with last narration: '{last_narr[:50]}...'")
     else:
         question = (
-            "Describe what's happening to a blind person use phrases like You are looking at ... or You see ... "
-            "Mention any people interacting or facing the user."
-            "Focus on movement, actions, and important changes. "
-            "Keep it brief and descriptive (1-2 sentences)."
-            "Do not focus on the background."
+            "You are looking at a scene. Describe the most important action or object in one very short sentence. "
+            "For example: 'A person is waving at you.' or 'A car is approaching.' "
+            "Do not describe the background or static objects."
         )
         print("🔄 [DEBUG] Using initial prompt (no previous narration)")
 
@@ -278,10 +287,26 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
         print(f"🔄 [DEBUG] Model response: '{answer}'")
 
         if answer and answer.strip():
+            clean_answer = answer.strip()
+
+            # Filter out unwanted phrases
+            static_phrases = ["static", "no change", "unchanged",
+                              "similar to before", "remains the same"]
+            if any(phrase in clean_answer.lower() for phrase in static_phrases):
+                print(
+                    f"🗑️ [DEBUG] Discarding static response for peer {sid}: '{clean_answer}'")
+                return None
+
+            # Filter out responses that are too similar to the last one
+            if are_texts_similar(clean_answer, last_narr):
+                print(
+                    f"🗑️ [DEBUG] Discarding similar response for peer {sid}: '{clean_answer}'")
+                return None
+
             # Send complete response directly (no word-by-word streaming)
             complete_message = {
                 'type': 'complete',
-                'full_text': answer.strip(),
+                'full_text': clean_answer,
                 'is_final': True
             }
 
@@ -289,16 +314,16 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
                 try:
                     narration_channel.send(json.dumps(complete_message))
                     print(
-                        f"✅ [DEBUG] Sent complete response: '{answer.strip()}'")
+                        f"✅ [DEBUG] Sent complete response: '{clean_answer}'")
                 except Exception as e:
                     print(
                         f"⚠️ [ERROR] Error sending complete response: {str(e)}")
 
             # Update last narration for context
-            last_narration_per_client[sid] = answer.strip()
+            last_narration_per_client[sid] = clean_answer
             print(f"✅ [DEBUG] Updated last narration for peer {sid}")
 
-            return answer.strip()
+            return clean_answer
         else:
             print("⚠️ [DEBUG] No response generated")
             return None
@@ -481,7 +506,8 @@ async def offer(request: Request):
                     current_time = time.time()
                     if current_time - last_fps_log_time.get(peer_id, 0) >= 5.0:
                         fps = frame_counter.get(peer_id, 0) / 5.0
-                        print(f"📊 [INFO] Peer {peer_id} incoming FPS: {fps:.2f}")
+                        print(
+                            f"📊 [INFO] Peer {peer_id} incoming FPS: {fps:.2f}")
                         frame_counter[peer_id] = 0
                         last_fps_log_time[peer_id] = current_time
 
