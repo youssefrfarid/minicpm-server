@@ -80,8 +80,8 @@ MAX_VIDEO_HISTORY = 30  # tokens of history for each client
 # Real-time frame processing system
 frame_buffers: Dict[str, List[Image.Image]] = {}
 narration_loops: Dict[str, asyncio.Task] = {}
-MAX_FRAMES_IN_BATCH = 12  # More frames for better temporal context
-NARRATION_INTERVAL = 1.5  # Slightly longer interval to accumulate more frames
+MAX_FRAMES_IN_BATCH = 8  # Reduced frames for faster processing
+NARRATION_INTERVAL = 2.0  # Longer interval for more descriptive responses
 
 
 # For FPS calculation
@@ -89,7 +89,7 @@ last_fps_log_time: Dict[str, float] = {}
 frame_counter: Dict[str, int] = {}
 
 # Frame difference threshold
-TEXT_SIMILARITY_THRESHOLD = 0.75  # Reduced from 0.85 to allow more variation
+TEXT_SIMILARITY_THRESHOLD = 0.65  # Further reduced to allow more variation
 
 
 # ─── Helper functions ───────────────────────────────────────────────────
@@ -172,20 +172,20 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
     # Build context-aware prompt for multi-frame processing
     if last_narr:
         question = (
-            f"Continue narrating for a visually impaired person. Last, you said: '{last_narr}'. "
-            "Look carefully at these frames in sequence and describe any new movement, change in position, "
-            "new objects appearing, or different actions in one very short sentence. "
-            "If nothing has genuinely changed, you may say 'No change detected.' "
-            "Examples: 'The person moves to the left.' or 'A cup appears on the table.'"
+            f"You are describing what a visually impaired person is currently seeing. "
+            f"Previously you mentioned: '{last_narr}'. "
+            "Now describe what is currently visible in the scene in one clear, short sentence. "
+            "Focus on the most prominent objects, people, or activities. "
+            "Examples: 'You are looking at a laptop on a wooden desk.' or 'A person is sitting in a chair.'"
         )
         print(
             f"🔄 [DEBUG] Using continuation prompt with last narration: '{last_narr[:50]}...'")
     else:
         question = (
-            "You are a scene narrator for a visually impaired person. Look at these video frames and describe "
-            "the most prominent object or action in a one or two very short sentence. "
-            "Focus on what's most important or interesting in the scene. "
-            "Examples: 'You are looking at a desk with a laptop.' or 'A person is holding a blue phone.'"
+            "You are describing what a visually impaired person is currently seeing. "
+            "Describe the main objects, people, or scene in one clear, short sentence. "
+            "Focus on what would be most helpful for navigation and understanding. "
+            "Examples: 'You are looking at a kitchen counter with a coffee mug.' or 'A desk with a computer and papers.'"
         )
         print("🔄 [DEBUG] Using initial prompt (no previous narration)")
 
@@ -243,29 +243,9 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
             if sentences:
                 clean_answer = sentences[0]
 
-            # Handle "No change detected" responses
-            if "no change detected" in clean_answer.lower():
-                # Increment no-change counter
-                no_change_count[sid] = no_change_count.get(sid, 0) + 1
-
-                # If we've had too many "no change" responses, reset context to get fresh perspective
-                if no_change_count[sid] >= 3:
-                    print(
-                        f"🔄 [DEBUG] Resetting context after {no_change_count[sid]} no-change responses")
-                    last_narration_per_client[sid] = ""
-                    no_change_count[sid] = 0
-                    return None  # Skip this response but reset context
-
-                # Allow some "no change" responses through
-                print(
-                    f"✅ [DEBUG] Allowing no-change response ({no_change_count[sid]}/3)")
-            else:
-                # Reset no-change counter on successful response
-                no_change_count[sid] = 0
-
-            # Filter out unwanted phrases (but allow "No change detected")
-            static_phrases = ["static", "unchanged",
-                              "similar to before", "remains the same"]
+            # Filter out unwanted static phrases
+            static_phrases = ["static", "unchanged", "similar to before", "remains the same",
+                              "no change", "no movement", "no new", "no different"]
             if any(phrase in clean_answer.lower() for phrase in static_phrases):
                 print(
                     f"🗑️ [DEBUG] Discarding static response for peer {sid}: '{clean_answer}'")
