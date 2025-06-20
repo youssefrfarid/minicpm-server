@@ -33,6 +33,7 @@ import json
 from typing import Dict, Optional, List, Any
 
 import cv2
+import numpy as np
 from PIL import Image
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
@@ -77,10 +78,34 @@ MAX_VIDEO_HISTORY = 30  # tokens of history for each client
 # Frame batching system
 frame_buffers: Dict[str, List[Image.Image]] = {}
 batch_timers: Dict[str, asyncio.Task] = {}
-BATCH_SIZE = 20  # Smaller batch size for faster response
-BATCH_TIMEOUT = 10.0  # Process batch every 2 seconds max
+BATCH_SIZE = 8  # Smaller batch size for faster response
+BATCH_TIMEOUT = 2.0  # Process batch every 2 seconds max
+
+# For FPS calculation
+last_fps_log_time: Dict[str, float] = {}
+frame_counter: Dict[str, int] = {}
+
+# Frame difference threshold
+FRAME_SIMILARITY_THRESHOLD = 1500  # MSE threshold to detect significant change
+
 
 # ─── Helper functions ───────────────────────────────────────────────────
+
+
+def are_frames_different(frame1: np.ndarray, frame2: np.ndarray) -> bool:
+    """Compare two frames using Mean Squared Error (MSE)."""
+    if frame1 is None or frame2 is None:
+        return True
+
+    # Resize for consistent and fast comparison
+    frame1_resized = cv2.resize(frame1, (128, 128))
+    frame2_resized = cv2.resize(frame2, (128, 128))
+
+    # Calculate MSE
+    mse = np.sum((frame1_resized.astype("float") - frame2_resized.astype("float")) ** 2)
+    mse /= float(frame1_resized.shape[0] * frame1_resized.shape[1])
+
+    return mse > FRAME_SIMILARITY_THRESHOLD
 
 
 def get_peer_id_from_channel(channel: RTCDataChannel) -> str:
@@ -106,7 +131,21 @@ async def process_batch_timeout(peer_id: str):
 
 
 async def add_frame_to_batch(peer_id: str, frame: Image.Image):
-    """Add frame to batch and handle batching logic."""
+    """Add frame to batch if it's different enough from the previous one."""
+    # Convert PIL Image to numpy array for comparison
+    current_frame_np = np.array(frame)
+
+    # Get the last received frame for this peer
+    last_frame_np = previous_frame_per_client.get(peer_id)
+
+    # Only add frame if it's significantly different
+    if not are_frames_different(last_frame_np, current_frame_np):
+        # print(f"📸 [DEBUG] Discarding similar frame for peer {peer_id}")
+        return
+
+    # Update the last received frame
+    previous_frame_per_client[peer_id] = current_frame_np
+
     # Initialize buffer if needed
     if peer_id not in frame_buffers:
         frame_buffers[peer_id] = []
@@ -150,6 +189,8 @@ def cleanup_peer_data(peer_id: str):
     previous_frame_per_client.pop(peer_id, None)
     last_narration_per_client.pop(peer_id, None)
     global_data_channels.pop(peer_id, None)
+    last_fps_log_time.pop(peer_id, None)
+    frame_counter.pop(peer_id, None)
 
     print(f"🧹 [DEBUG] Cleaned up all data for peer {peer_id}")
 
@@ -422,51 +463,57 @@ async def offer(request: Request):
         if track.kind != "video":
             return
 
-        print(f"📺 Video track received for peer {pc.id}")
-        frame_count = 0
+        peer_id = pc.id
+        print(f"📺 Video track received for peer {peer_id}")
+
+        # Initialize FPS counter
+        last_fps_log_time[peer_id] = time.time()
+        frame_counter[peer_id] = 0
 
         try:
             while True:
                 try:
                     # Get next video frame
                     frame = await track.recv()
-                    frame_count += 1
+                    frame_counter[peer_id] += 1
 
-                    # Skip frames to reduce processing load (process every 5th frame)
-                    if frame_count % 5 != 0:
-                        continue
+                    # Log FPS periodically
+                    current_time = time.time()
+                    if current_time - last_fps_log_time.get(peer_id, 0) >= 5.0:
+                        fps = frame_counter.get(peer_id, 0) / 5.0
+                        print(f"📊 [INFO] Peer {peer_id} incoming FPS: {fps:.2f}")
+                        frame_counter[peer_id] = 0
+                        last_fps_log_time[peer_id] = current_time
 
                     # Convert frame to RGB PIL Image
                     bgr = frame.to_ndarray(format="bgr24")
                     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                    # Standard size for processing
-                    rgb = cv2.resize(rgb, (384, 384))
                     pil_img = Image.fromarray(rgb)
 
-                    # Add frame to batch processing system
-                    await add_frame_to_batch(pc.id, pil_img)
+                    # Add frame to batch processing system (with difference check)
+                    await add_frame_to_batch(peer_id, pil_img)
 
                 except MediaStreamError as e:
-                    print(f"🔌 Video track ended for peer {pc.id}: {e}")
+                    print(f"🔌 Video track ended for peer {peer_id}: {e}")
                     break
                 except Exception as frame_error:
                     print(
-                        f"⚠️ [ERROR] Error processing video frame for peer {pc.id}: {frame_error}")
+                        f"⚠️ [ERROR] Error processing video frame for peer {peer_id}: {frame_error}")
                     continue
 
         except Exception as e:
             print(
-                f"❌ [ERROR] Error in video track processing for peer {pc.id}: {e}")
+                f"❌ [ERROR] Error in video track processing for peer {peer_id}: {e}")
         finally:
             # Process any remaining frames in buffer
-            if pc.id in frame_buffers and frame_buffers[pc.id]:
+            if peer_id in frame_buffers and frame_buffers[peer_id]:
                 print(
-                    f"🔄 [DEBUG] Processing final batch of {len(frame_buffers[pc.id])} frames for peer {pc.id}")
-                final_frames = frame_buffers[pc.id].copy()
-                frame_buffers[pc.id] = []
-                asyncio.create_task(process_frame(pc.id, final_frames))
+                    f"🔄 [DEBUG] Processing final batch of {len(frame_buffers[peer_id])} frames for peer {peer_id}")
+                final_frames = frame_buffers[peer_id].copy()
+                frame_buffers[peer_id] = []
+                asyncio.create_task(process_frame(peer_id, final_frames))
 
-            print(f"📺 Video processing ended for peer {pc.id}")
+            print(f"📺 Video processing ended for peer {peer_id}")
             # Note: Don't clean up peer data here as it might still be needed
 
     @pc.on("connectionstatechange")
