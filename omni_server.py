@@ -150,7 +150,7 @@ async def add_frame_to_batch(peer_id: str, frame: Image.Image):
 
     # Only add frame if it's significantly different
     if not are_frames_different(last_frame_np, current_frame_np):
-        # print(f"📸 [DEBUG] Discarding similar frame for peer {peer_id}")
+        print(f"📸 [DEBUG] Discarding similar frame for peer {peer_id}")
         return
 
     # Update the last received frame
@@ -234,8 +234,9 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
             f"🔄 [DEBUG] Using continuation prompt with last narration: '{last_narr[:50]}...'")
     else:
         question = (
-            "You are looking at a scene. Describe the most important action or object in one very short sentence. "
+            "Describe the most important actions or objects in very short sentence. "
             "For example: 'A person is waving at you.' or 'A car is approaching.' "
+            "Use phrases like 'You see a person waving at you.' or 'You see a car approaching.' "
             "Do not describe the background or static objects."
         )
         print("🔄 [DEBUG] Using initial prompt (no previous narration)")
