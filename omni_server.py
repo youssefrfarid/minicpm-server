@@ -69,6 +69,7 @@ pcs: Dict[str, RTCPeerConnection] = {}
 global_data_channels: Dict[str, Dict[str, RTCDataChannel]] = {}
 global_peer_data: Dict[str, Dict] = {}  # For storing peer-specific data
 last_narration_per_client: Dict[str, str] = {}
+no_change_count: Dict[str, int] = {}  # Track consecutive "no change" responses
 
 # Authentication store
 auth_tokens = set()
@@ -88,7 +89,7 @@ last_fps_log_time: Dict[str, float] = {}
 frame_counter: Dict[str, int] = {}
 
 # Frame difference threshold
-TEXT_SIMILARITY_THRESHOLD = 0.85  # For comparing narration sentences
+TEXT_SIMILARITY_THRESHOLD = 0.75  # Reduced from 0.85 to allow more variation
 
 
 # ─── Helper functions ───────────────────────────────────────────────────
@@ -142,6 +143,7 @@ def cleanup_peer_data(peer_id: str):
 
     # Clear other peer data
     last_narration_per_client.pop(peer_id, None)
+    no_change_count.pop(peer_id, None)
     global_data_channels.pop(peer_id, None)
     last_fps_log_time.pop(peer_id, None)
     frame_counter.pop(peer_id, None)
@@ -241,8 +243,28 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
             if sentences:
                 clean_answer = sentences[0]
 
-            # Filter out unwanted phrases
-            static_phrases = ["static", "no change", "unchanged",
+            # Handle "No change detected" responses
+            if "no change detected" in clean_answer.lower():
+                # Increment no-change counter
+                no_change_count[sid] = no_change_count.get(sid, 0) + 1
+
+                # If we've had too many "no change" responses, reset context to get fresh perspective
+                if no_change_count[sid] >= 3:
+                    print(
+                        f"🔄 [DEBUG] Resetting context after {no_change_count[sid]} no-change responses")
+                    last_narration_per_client[sid] = ""
+                    no_change_count[sid] = 0
+                    return None  # Skip this response but reset context
+
+                # Allow some "no change" responses through
+                print(
+                    f"✅ [DEBUG] Allowing no-change response ({no_change_count[sid]}/3)")
+            else:
+                # Reset no-change counter on successful response
+                no_change_count[sid] = 0
+
+            # Filter out unwanted phrases (but allow "No change detected")
+            static_phrases = ["static", "unchanged",
                               "similar to before", "remains the same"]
             if any(phrase in clean_answer.lower() for phrase in static_phrases):
                 print(
@@ -458,9 +480,21 @@ async def offer(request: Request):
                         last_fps_log_time[peer_id] = current_time
 
                     # Convert frame to RGB PIL Image (no resizing - handled by client)
-                    bgr = frame.to_ndarray(format="bgr24")
-                    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                    pil_img = Image.fromarray(rgb)
+                    try:
+                        bgr = frame.to_ndarray(format="bgr24")
+                        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                        pil_img = Image.fromarray(rgb)
+
+                        # Validate frame dimensions - skip if too small or inconsistent
+                        if pil_img.size[0] < 200 or pil_img.size[1] < 200:
+                            print(
+                                f"⚠️ [DEBUG] Skipping frame with invalid dimensions: {pil_img.size}")
+                            continue
+
+                    except Exception as frame_convert_error:
+                        print(
+                            f"⚠️ [DEBUG] Failed to convert frame: {frame_convert_error}")
+                        continue
 
                     # Add frame to buffer, keeping it at a max size
                     if peer_id in frame_buffers:
