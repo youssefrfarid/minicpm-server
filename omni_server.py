@@ -79,15 +79,15 @@ MAX_VIDEO_HISTORY = 30  # tokens of history for each client
 # Frame batching system
 frame_buffers: Dict[str, List[Image.Image]] = {}
 batch_timers: Dict[str, asyncio.Task] = {}
-BATCH_SIZE = 8  # Smaller batch size for faster response
-BATCH_TIMEOUT = 2.0  # Process batch every 2 seconds max
+BATCH_SIZE = 10  # Larger batch size for more context
+BATCH_TIMEOUT = 3.0  # Process batch every 3 seconds max
 
 # For FPS calculation
 last_fps_log_time: Dict[str, float] = {}
 frame_counter: Dict[str, int] = {}
 
 # Frame difference threshold
-FRAME_SIMILARITY_THRESHOLD = 1500  # MSE threshold to detect significant change
+FRAME_SIMILARITY_THRESHOLD = 2000  # Increased threshold to be less sensitive
 TEXT_SIMILARITY_THRESHOLD = 0.85  # For comparing narration sentences
 
 
@@ -150,7 +150,7 @@ async def add_frame_to_batch(peer_id: str, frame: Image.Image):
 
     # Only add frame if it's significantly different
     if not are_frames_different(last_frame_np, current_frame_np):
-        print(f"📸 [DEBUG] Discarding similar frame for peer {peer_id}")
+        # print(f"📸 [DEBUG] Discarding similar frame for peer {peer_id}")
         return
 
     # Update the last received frame
@@ -234,9 +234,8 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
             f"🔄 [DEBUG] Using continuation prompt with last narration: '{last_narr[:50]}...'")
     else:
         question = (
-            "Describe the most important actions or objects in very short sentence. "
+            "You are looking at a scene. Describe the most important action or object in one very short sentence. "
             "For example: 'A person is waving at you.' or 'A car is approaching.' "
-            "Use phrases like 'You see a person waving at you.' or 'You see a car approaching.' "
             "Do not describe the background or static objects."
         )
         print("🔄 [DEBUG] Using initial prompt (no previous narration)")
@@ -495,6 +494,7 @@ async def offer(request: Request):
         # Initialize FPS counter
         last_fps_log_time[peer_id] = time.time()
         frame_counter[peer_id] = 0
+        track_frame_counter = 0  # For skipping frames
 
         try:
             while True:
@@ -502,6 +502,11 @@ async def offer(request: Request):
                     # Get next video frame
                     frame = await track.recv()
                     frame_counter[peer_id] += 1
+                    track_frame_counter += 1
+
+                    # Skip frames to reduce processing load (process every 3rd frame)
+                    if track_frame_counter % 3 != 0:
+                        continue
 
                     # Log FPS periodically
                     current_time = time.time()
