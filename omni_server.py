@@ -30,6 +30,7 @@ import logging
 import uuid
 import time
 import json
+import re
 from typing import Dict, Optional, List, Any
 from difflib import SequenceMatcher
 
@@ -192,16 +193,17 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
     # Build context-aware prompt for multi-frame processing
     if last_narr:
         question = (
-            f"Continue the narration for a visually impaired person. Previously, you said: '{last_narr}'. "
-            "Describe what has changed or what is happening now. For example, 'The person is now walking away.' "
-            "or 'You are now looking at a storefront.' Keep it conversational and brief (1-2 sentences)."
+            f"Continue narrating for a visually impaired person. Last, you said: '{last_narr}'. "
+            "Describe only the newest, most important change in one extremely short sentence. "
+            "For example: 'The person is now walking away.' Do not repeat previous information."
         )
         print(
             f"🔄 [DEBUG] Using continuation prompt with last narration: '{last_narr[:50]}...'")
     else:
         question = (
-            "You are providing live narration for a visually impaired person. Describe the scene in a conversational and reassuring tone. "
-            "Start with 'You are looking at...' or describe a key action like 'A person is waving at you.' Keep it to 1-2 concise sentences."
+            "You are a scene narrator for a visually impaired person. Describe the most prominent object or action in a single, very short sentence. "
+            "For example: 'You are looking at a desk with a model airplane.' or 'A person is waving at you.' "
+            "Be extremely concise."
         )
         print("🔄 [DEBUG] Using initial prompt (no previous narration)")
 
@@ -253,6 +255,11 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
 
         if answer and answer.strip():
             clean_answer = answer.strip()
+
+            # Take only the first sentence to keep it brief
+            sentences = re.split(r'(?<=[.!?])\s+', clean_answer)
+            if sentences:
+                clean_answer = sentences[0]
 
             # Filter out unwanted phrases
             static_phrases = ["static", "no change", "unchanged",
@@ -485,9 +492,12 @@ async def offer(request: Request):
                     # Convert frame to RGB PIL Image
                     bgr = frame.to_ndarray(format="bgr24")
                     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                    pil_img = Image.fromarray(rgb)
 
-                    # Add frame to batch processing system (with difference check)
+                    # Compress frame by resizing
+                    resized_rgb = cv2.resize(rgb, (224, 224))
+                    pil_img = Image.fromarray(resized_rgb)
+
+                    # Add frame to batch processing system
                     await add_frame_to_batch(peer_id, pil_img)
 
                 except MediaStreamError as e:
