@@ -76,11 +76,12 @@ auth_tokens = set()
 # ─── Shared session state ───────────────────────────────────────────────
 MAX_VIDEO_HISTORY = 30  # tokens of history for each client
 
-# Frame batching system
+# Real-time frame processing system
 frame_buffers: Dict[str, List[Image.Image]] = {}
-batch_timers: Dict[str, asyncio.Task] = {}
-BATCH_SIZE = 10  # Larger batch size for more context
-BATCH_TIMEOUT = 3.0  # Process batch every 3 seconds max
+narration_loops: Dict[str, asyncio.Task] = {}
+MAX_FRAMES_IN_BATCH = 5  # Max frames to hold, ensuring we only process the latest
+NARRATION_INTERVAL = 1.0  # Seconds between narration attempts
+
 
 # For FPS calculation
 last_fps_log_time: Dict[str, float] = {}
@@ -100,65 +101,41 @@ def are_texts_similar(a: str, b: str) -> bool:
     return SequenceMatcher(None, a, b).ratio() > TEXT_SIMILARITY_THRESHOLD
 
 
-def get_peer_id_from_channel(channel: RTCDataChannel) -> str:
-    """Extract peer ID from data channel."""
-    return f"peer_{id(channel)}"
+def get_peer_id_from_channel(channel: RTCDataChannel) -> str | None:
+    """Extract peer ID from data channel by searching global state."""
+    for peer_id, channels in global_data_channels.items():
+        if channel.label in channels and channels[channel.label] == channel:
+            return peer_id
+    print("⚠️ [WARNING] Could not find peer_id for channel.")
+    return None
 
 
-async def process_batch_timeout(peer_id: str):
-    """Process batch after timeout expires."""
-    await asyncio.sleep(BATCH_TIMEOUT)
+async def narration_loop(peer_id: str):
+    """Periodically process the latest frames from the buffer."""
+    while peer_id in pcs:
+        await asyncio.sleep(NARRATION_INTERVAL)
 
-    if peer_id in frame_buffers and frame_buffers[peer_id]:
-        print(
-            f"⏰ [DEBUG] Timeout triggered batch processing for peer {peer_id}")
-        frames = frame_buffers[peer_id].copy()
-        frame_buffers[peer_id] = []
+        if peer_id in frame_buffers and frame_buffers[peer_id]:
+            # Copy the latest frames and clear the buffer immediately
+            # to avoid processing stale frames on the next iteration.
+            frames_to_process = frame_buffers[peer_id].copy()
+            frame_buffers[peer_id].clear()
 
-        # Clear the timer
-        batch_timers.pop(peer_id, None)
-
-        # Process the batch
-        asyncio.create_task(process_frame(peer_id, frames))
-
-
-async def add_frame_to_batch(peer_id: str, frame: Image.Image):
-    """Add frame to batch for processing."""
-    # Initialize buffer if needed
-    if peer_id not in frame_buffers:
-        frame_buffers[peer_id] = []
-
-    # Add frame to buffer
-    frame_buffers[peer_id].append(frame)
-    print(
-        f"🎞️ [DEBUG] Added frame to batch for peer {peer_id} (buffer size: {len(frame_buffers[peer_id])})")
-
-    # Cancel existing timer if present
-    if peer_id in batch_timers:
-        batch_timers[peer_id].cancel()
-        batch_timers.pop(peer_id, None)
-
-    # Check if we should process the batch
-    if len(frame_buffers[peer_id]) >= BATCH_SIZE:
-        print(
-            f"🎞️ [DEBUG] Batch size reached for peer {peer_id}, processing immediately")
-        frames = frame_buffers[peer_id].copy()
-        frame_buffers[peer_id] = []
-
-        # Process the batch
-        asyncio.create_task(process_frame(peer_id, frames))
-    else:
-        # Start timeout timer
-        batch_timers[peer_id] = asyncio.create_task(
-            process_batch_timeout(peer_id))
+            print(
+                f"🔄 [NARRATION_LOOP] Processing batch of {len(frames_to_process)} frames for peer {peer_id}")
+            # Process the batch without blocking the loop for too long
+            asyncio.create_task(process_frame(peer_id, frames_to_process))
+        else:
+            # This is not an error, just means no new frames arrived.
+            pass
 
 
 def cleanup_peer_data(peer_id: str):
     """Clean up all data for a peer."""
-    # Cancel any pending batch timer
-    if peer_id in batch_timers:
-        batch_timers[peer_id].cancel()
-        batch_timers.pop(peer_id, None)
+    # Cancel the narration loop
+    if peer_id in narration_loops:
+        narration_loops[peer_id].cancel()
+        narration_loops.pop(peer_id, None)
 
     # Clear frame buffer
     frame_buffers.pop(peer_id, None)
@@ -345,34 +322,13 @@ app = FastAPI()
 # Data channel message handler
 
 
-async def on_message(channel: RTCDataChannel, message: str):
-    """Handle incoming WebRTC data channel messages."""
-    try:
-        data = json.loads(message)
-        msg_type = data.get('type')
-
-        print(f"📨 [DEBUG] Received message: {msg_type}")
-
-        if msg_type == 'start_narration':
-            # Handle narration start request
-            await handle_start_narration(channel, data)
-        elif msg_type == 'end_stream':
-            # Handle stream end request
-            await handle_end_stream(channel, data)
-        elif msg_type == 'question':
-            # Handle question request
-            await handle_question(channel, data)
-        else:
-            print(f"⚠️ [DEBUG] Unknown message type: {msg_type}")
-
-    except Exception as e:
-        print(f"❌ [DEBUG] Error in on_message: {e}")
-
-
 async def handle_start_narration(channel: RTCDataChannel, data: Dict[str, Any]):
     """Handle start narration request."""
     try:
         peer_id = get_peer_id_from_channel(channel)
+        if not peer_id:
+            return
+
         client_id = data.get('client_id', 'unknown')
 
         print(
@@ -393,14 +349,13 @@ async def handle_end_stream(channel: RTCDataChannel, data: Dict[str, Any]):
     """Handle end stream request."""
     try:
         peer_id = get_peer_id_from_channel(channel)
+        if not peer_id:
+            return
 
         print(f"🛑 [DEBUG] Ending stream for peer {peer_id}")
 
         # Clean up any peer-specific data
-        if peer_id in previous_frame_per_client:
-            del previous_frame_per_client[peer_id]
-        if peer_id in last_narration_per_client:
-            del last_narration_per_client[peer_id]
+        cleanup_peer_data(peer_id)
 
         # Send acknowledgment
         response = {
@@ -411,6 +366,25 @@ async def handle_end_stream(channel: RTCDataChannel, data: Dict[str, Any]):
 
     except Exception as e:
         print(f"❌ [DEBUG] Error in handle_end_stream: {e}")
+
+
+async def on_message(channel: RTCDataChannel, message: str):
+    """Handle incoming WebRTC data channel messages."""
+    try:
+        data = json.loads(message)
+        msg_type = data.get('type')
+
+        print(f"📨 [DEBUG] Received message: {msg_type}")
+
+        if msg_type == 'start_narration':
+            await handle_start_narration(channel, data)
+        elif msg_type == 'end_stream':
+            await handle_end_stream(channel, data)
+        else:
+            print(f"⚠️ [DEBUG] Unknown message type: {msg_type}")
+
+    except Exception as e:
+        print(f"❌ [DEBUG] Error in on_message: {e}")
 
 
 @app.post("/offer")
@@ -428,31 +402,14 @@ async def offer(request: Request):
     # Initialize data channels dictionary for this peer
     global_data_channels[peer_id] = {}
 
-    # Handle any additional data channels created by the client
     @pc.on("datachannel")
     def on_datachannel(channel):
-        channel_id = channel.label
-        print(
-            f"🔌 Client-created data channel '{channel_id}' for peer {peer_id}")
-        global_data_channels[peer_id][channel_id] = channel
+        global_data_channels[peer_id][channel.label] = channel
+        print(f"📦 Data channel '{channel.label}' created for peer {peer_id}")
 
-        # Special handling for narration channel
-        if channel_id == "narration":
-            print(f"🔌 Narration channel received for peer {peer_id}")
-
-            @channel.on("open")
-            def on_narration_open():
-                print(f"🔌 Narration channel opened for peer {peer_id}")
-
-            @channel.on("message")
-            def on_narration_message(message):
-                asyncio.create_task(on_message(channel, message))
-        else:
-            @channel.on("message")
-            def on_channel_message(message):
-                asyncio.create_task(on_message(channel, message))
-
-    recorder = MediaBlackhole()
+        @channel.on("message")
+        async def on_message_wrapper(message):
+            await on_message(channel, message)
 
     @pc.on("track")
     async def on_track(track):
@@ -463,10 +420,17 @@ async def offer(request: Request):
         peer_id = pc.id
         print(f"📺 Video track received for peer {peer_id}")
 
-        # Initialize FPS counter
+        # Initialize FPS counter and frame buffer
         last_fps_log_time[peer_id] = time.time()
         frame_counter[peer_id] = 0
+        frame_buffers[peer_id] = []
         track_frame_counter = 0  # For skipping frames
+
+        # Start the narration loop for this peer
+        if peer_id not in narration_loops:
+            loop = asyncio.get_event_loop()
+            narration_loops[peer_id] = loop.create_task(narration_loop(peer_id))
+            print(f"✅ [DEBUG] Started narration loop for peer {peer_id}")
 
         try:
             while True:
@@ -489,16 +453,17 @@ async def offer(request: Request):
                         frame_counter[peer_id] = 0
                         last_fps_log_time[peer_id] = current_time
 
-                    # Convert frame to RGB PIL Image
+                    # Convert frame to RGB PIL Image (no resizing - handled by client)
                     bgr = frame.to_ndarray(format="bgr24")
                     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                    pil_img = Image.fromarray(rgb)
 
-                    # Compress frame by resizing
-                    resized_rgb = cv2.resize(rgb, (224, 224))
-                    pil_img = Image.fromarray(resized_rgb)
-
-                    # Add frame to batch processing system
-                    await add_frame_to_batch(peer_id, pil_img)
+                    # Add frame to buffer, keeping it at a max size
+                    if peer_id in frame_buffers:
+                        frame_buffers[peer_id].append(pil_img)
+                        if len(frame_buffers[peer_id]) > MAX_FRAMES_IN_BATCH:
+                            # Remove oldest frame
+                            frame_buffers[peer_id].pop(0)
 
                 except MediaStreamError as e:
                     print(f"🔌 Video track ended for peer {peer_id}: {e}")
@@ -512,26 +477,22 @@ async def offer(request: Request):
             print(
                 f"❌ [ERROR] Error in video track processing for peer {peer_id}: {e}")
         finally:
-            # Process any remaining frames in buffer
-            if peer_id in frame_buffers and frame_buffers[peer_id]:
-                print(
-                    f"🔄 [DEBUG] Processing final batch of {len(frame_buffers[peer_id])} frames for peer {peer_id}")
-                final_frames = frame_buffers[peer_id].copy()
-                frame_buffers[peer_id] = []
-                asyncio.create_task(process_frame(peer_id, final_frames))
-
+            # The narration loop will handle remaining frames.
+            # We just need to signal that this track is done.
             print(f"📺 Video processing ended for peer {peer_id}")
-            # Note: Don't clean up peer data here as it might still be needed
+            # The on_state_change handler will do the final cleanup.
 
     @pc.on("connectionstatechange")
     async def on_state_change():
+        print(f"ℹ️ Connection state is {pc.connectionState}")
         if pc.connectionState in ("failed", "closed", "disconnected"):
-            await pc.close()
-            pcs.pop(peer_id, None)
-            # Clean up all peer-specific data
-            cleanup_peer_data(peer_id)
-            print(f"🛑 Peer {peer_id} closed and cleaned up")
+            print(f"🔌 Peer {pc.id} disconnected.")
+            if pc.id in pcs:
+                await pcs[pc.id].close()
+                pcs.pop(pc.id, None)
+                cleanup_peer_data(pc.id)
 
+    # Handle offer
     await pc.setRemoteDescription(offer)
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
