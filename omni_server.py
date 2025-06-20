@@ -68,7 +68,6 @@ pcs: Dict[str, RTCPeerConnection] = {}
 global_data_channels: Dict[str, Dict[str, RTCDataChannel]] = {}
 global_peer_data: Dict[str, Dict] = {}  # For storing peer-specific data
 last_narration_per_client: Dict[str, str] = {}
-previous_frame_per_client: Dict[str, Optional[Image.Image]] = {}
 
 # Authentication store
 auth_tokens = set()
@@ -87,7 +86,6 @@ last_fps_log_time: Dict[str, float] = {}
 frame_counter: Dict[str, int] = {}
 
 # Frame difference threshold
-FRAME_SIMILARITY_THRESHOLD = 2000  # Increased threshold to be less sensitive
 TEXT_SIMILARITY_THRESHOLD = 0.85  # For comparing narration sentences
 
 
@@ -99,23 +97,6 @@ def are_texts_similar(a: str, b: str) -> bool:
     if not a or not b:
         return False
     return SequenceMatcher(None, a, b).ratio() > TEXT_SIMILARITY_THRESHOLD
-
-
-def are_frames_different(frame1: np.ndarray, frame2: np.ndarray) -> bool:
-    """Compare two frames using Mean Squared Error (MSE)."""
-    if frame1 is None or frame2 is None:
-        return True
-
-    # Resize for consistent and fast comparison
-    frame1_resized = cv2.resize(frame1, (128, 128))
-    frame2_resized = cv2.resize(frame2, (128, 128))
-
-    # Calculate MSE
-    mse = np.sum((frame1_resized.astype("float") -
-                 frame2_resized.astype("float")) ** 2)
-    mse /= float(frame1_resized.shape[0] * frame1_resized.shape[1])
-
-    return mse > FRAME_SIMILARITY_THRESHOLD
 
 
 def get_peer_id_from_channel(channel: RTCDataChannel) -> str:
@@ -141,21 +122,7 @@ async def process_batch_timeout(peer_id: str):
 
 
 async def add_frame_to_batch(peer_id: str, frame: Image.Image):
-    """Add frame to batch if it's different enough from the previous one."""
-    # Convert PIL Image to numpy array for comparison
-    current_frame_np = np.array(frame)
-
-    # Get the last received frame for this peer
-    last_frame_np = previous_frame_per_client.get(peer_id)
-
-    # Only add frame if it's significantly different
-    if not are_frames_different(last_frame_np, current_frame_np):
-        # print(f"📸 [DEBUG] Discarding similar frame for peer {peer_id}")
-        return
-
-    # Update the last received frame
-    previous_frame_per_client[peer_id] = current_frame_np
-
+    """Add frame to batch for processing."""
     # Initialize buffer if needed
     if peer_id not in frame_buffers:
         frame_buffers[peer_id] = []
@@ -196,7 +163,6 @@ def cleanup_peer_data(peer_id: str):
     frame_buffers.pop(peer_id, None)
 
     # Clear other peer data
-    previous_frame_per_client.pop(peer_id, None)
     last_narration_per_client.pop(peer_id, None)
     global_data_channels.pop(peer_id, None)
     last_fps_log_time.pop(peer_id, None)
@@ -226,17 +192,16 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
     # Build context-aware prompt for multi-frame processing
     if last_narr:
         question = (
-            f"Briefly describe what's new. Previously: '{last_narr}'. "
-            "Focus only on new actions or objects. Be very concise (max 1 sentence). "
-            "Do not mention if the scene is similar or static."
+            f"Continue the narration for a visually impaired person. Previously, you said: '{last_narr}'. "
+            "Describe what has changed or what is happening now. For example, 'The person is now walking away.' "
+            "or 'You are now looking at a storefront.' Keep it conversational and brief (1-2 sentences)."
         )
         print(
             f"🔄 [DEBUG] Using continuation prompt with last narration: '{last_narr[:50]}...'")
     else:
         question = (
-            "You are looking at a scene. Describe the most important action or object in one very short sentence. "
-            "For example: 'A person is waving at you.' or 'A car is approaching.' "
-            "Do not describe the background or static objects."
+            "You are providing live narration for a visually impaired person. Describe the scene in a conversational and reassuring tone. "
+            "Start with 'You are looking at...' or describe a key action like 'A person is waving at you.' Keep it to 1-2 concise sentences."
         )
         print("🔄 [DEBUG] Using initial prompt (no previous narration)")
 
