@@ -94,7 +94,6 @@ narration_loops: Dict[str, asyncio.Task] = {}
 MAX_FRAMES_IN_BATCH = 12  # Size of sliding window for frames
 NARRATION_INTERVAL = 2.0  # Interval for streaming_generate calls
 GLOBAL_SESSION_ID = "global_session"  # Single session ID for the model
-
 # MiniCPM-o streaming system state
 model_initialized = False  # Track if the model session has been initialized
 
@@ -180,7 +179,6 @@ async def initialize_streaming_session():
     """Initialize the MiniCPM-o streaming session.
     Should be called once at the beginning of the application.
     """
-    global model_initialized
     
     if model_initialized:
         return True
@@ -329,10 +327,9 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
                 if static_response_count[sid] >= MAX_STATIC_RESPONSES:
                     print(f"⚠️ [WARNING] Too many static responses for peer {sid}, resetting streaming session")
                     # Reset the session
-                    global model_initialized  # Declare global at beginning of scope
                     try:
                         model_initialized = False  # Force re-initialization
-                        model.reset_session(session_id=GLOBAL_SESSION_ID)  # Clean slate
+                        model.reset_session()  # Clean slate
                         await initialize_streaming_session()  # Re-initialize with system prompt
                         
                         # Clear part of the frame buffer to get fresh frames
