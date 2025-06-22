@@ -329,8 +329,8 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
                 if static_response_count[sid] >= MAX_STATIC_RESPONSES:
                     print(f"⚠️ [WARNING] Too many static responses for peer {sid}, resetting streaming session")
                     # Reset the session
+                    global model_initialized  # Declare global at beginning of scope
                     try:
-                        global model_initialized
                         model_initialized = False  # Force re-initialization
                         model.reset_session(session_id=GLOBAL_SESSION_ID)  # Clean slate
                         await initialize_streaming_session()  # Re-initialize with system prompt
