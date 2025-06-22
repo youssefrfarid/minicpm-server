@@ -174,20 +174,20 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
         question = (
             f"You are describing what a visually impaired person is currently seeing. "
             f"Previously you mentioned: '{last_narr}'. "
-            "Now describe what they are looking at in conversational language. "
-            "Include any people or objects directly in front of the camera - avoid background scene details. "
-            "Use phrases like 'You are looking at...', 'There is... in front of you', 'The person in front is...' "
-            "Examples: 'You are looking at a laptop and coffee mug' or 'There is a person typing in front of you' or 'The person in front is holding a phone.'"
+            "Now describe what they are looking at in 1-2 SHORT sentences using conversational language. "
+            "Focus ONLY on main objects or people in front of the camera. Be brief and direct. "
+            "Use phrases like 'You are looking at...', 'There is... in front of you'. "
+            "Examples: 'You are looking at a laptop.' or 'There is a person typing in front of you.'"
         )
         print(
             f"🔄 [DEBUG] Using continuation prompt with last narration: '{last_narr[:50]}...'")
     else:
         question = (
             "You are describing what a visually impaired person is currently seeing. "
-            "Describe what they are looking at using conversational language in one short sentence. "
-            "Include any people or objects directly in front of the camera - avoid background scene details. "
-            "Use phrases like 'You are looking at...', 'There is... in front of you', 'The person in front is...' "
-            "Examples: 'You are looking at a wooden desk with papers' or 'There is a person sitting nearby' or 'You are looking at someone's hands on a keyboard.'"
+            "Describe what they are looking at in ONE SHORT sentence using conversational language. "
+            "Focus ONLY on the main object or person directly in front of the camera. Be brief and direct. "
+            "Use phrases like 'You are looking at...', 'There is... in front of you'. "
+            "Examples: 'You are looking at a laptop.' or 'There is a person sitting nearby.' or 'You are looking at someone's hands.'"
         )
         print("🔄 [DEBUG] Using initial prompt (no previous narration)")
 
@@ -240,10 +240,10 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
         if answer and answer.strip():
             clean_answer = answer.strip()
 
-            # Limit to maximum of 3 sentences to keep it brief but descriptive
+            # Limit to maximum of 2 sentences to keep it brief for real-time TTS
             sentences = re.split(r'(?<=[.!?])\s+', clean_answer)
-            if len(sentences) > 3:
-                clean_answer = '. '.join(sentences[:3]) + '.'
+            if len(sentences) > 2:
+                clean_answer = '. '.join(sentences[:2]) + '.'
 
             # Filter out unwanted static phrases
             static_phrases = ["static", "unchanged", "similar to before", "remains the same",
