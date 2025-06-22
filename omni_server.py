@@ -278,10 +278,12 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
         print("🔄 [DEBUG] Running model.streaming_generate()...")
         
         # Use the streaming generate method to get incremental responses
+        # Explicitly disable audio generation to avoid tts_processor error
         response_iterator = model.streaming_generate(
             session_id=GLOBAL_SESSION_ID,
             tokenizer=tokenizer,
-            temperature=0.5
+            temperature=0.5,
+            generate_audio=False  # Disable audio generation to avoid tts_processor error
         )
         
         # Collect the response chunks
