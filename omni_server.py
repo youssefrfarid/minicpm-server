@@ -64,12 +64,20 @@ print("✅ Model loaded", flush=True)
 
 # ─── Global state management ───────────────────────────────────────────────
 
-# Global stores for peer connections and data channels
-pcs: Dict[str, RTCPeerConnection] = {}
-global_data_channels: Dict[str, Dict[str, RTCDataChannel]] = {}
-global_peer_data: Dict[str, Dict] = {}  # For storing peer-specific data
+# Global constants
+GLOBAL_SESSION_ID = "global_session"  # Single session ID for all peers for MVP
+model_initialized = False  # Flag to track if the streaming session has been initialized
+
+# Track consecutive no-change responses per client
+frame_buffers: Dict[str, List[Image.Image]] = {}  # Maps peer_id -> frames
+frame_counter: Dict[str, int] = {}
+last_fps_log_time: Dict[str, float] = {}
 last_narration_per_client: Dict[str, str] = {}
 no_change_count: Dict[str, int] = {}  # Track consecutive "no change" responses
+static_response_count: Dict[str, int] = {}  # Track consecutive static responses
+
+# Maximum number of static responses before resetting the session
+MAX_STATIC_RESPONSES = 3
 
 # MiniCPM-o streaming session management
 # Using a single global session for now
@@ -308,9 +316,37 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
             # Filter out unwanted static phrases
             static_phrases = ["static", "unchanged", "similar to before", "remains the same",
                               "no change", "no movement", "no new", "no different"]
-            if any(phrase in clean_answer.lower() for phrase in static_phrases):
-                print(
-                    f"🗑️ [DEBUG] Discarding static response for peer {sid}: '{clean_answer}'")
+            
+            # Check if the response is static
+            is_static = any(phrase in clean_answer.lower() for phrase in static_phrases)
+            
+            if is_static:
+                # Increment the static response counter for this peer
+                static_response_count[sid] = static_response_count.get(sid, 0) + 1
+                print(f"🗑️ [DEBUG] Discarding static response for peer {sid} (count: {static_response_count[sid]}): '{clean_answer}'")
+                
+                # Check if we've had too many static responses in a row
+                if static_response_count[sid] >= MAX_STATIC_RESPONSES:
+                    print(f"⚠️ [WARNING] Too many static responses for peer {sid}, resetting streaming session")
+                    # Reset the session
+                    try:
+                        global model_initialized
+                        model_initialized = False  # Force re-initialization
+                        model.reset_session(session_id=GLOBAL_SESSION_ID)  # Clean slate
+                        await initialize_streaming_session()  # Re-initialize with system prompt
+                        
+                        # Clear part of the frame buffer to get fresh frames
+                        if sid in frame_buffers and len(frame_buffers[sid]) > 0:
+                            # Keep only the most recent frames
+                            frames_to_keep = min(5, len(frame_buffers[sid]))
+                            frame_buffers[sid] = frame_buffers[sid][-frames_to_keep:]
+                            print(f"🔄 [DEBUG] Frame buffer partially cleared for peer {sid}, keeping {frames_to_keep} frames")
+                        
+                        # Reset the static response counter
+                        static_response_count[sid] = 0
+                    except Exception as e:
+                        print(f"❌ [ERROR] Failed to reset session: {str(e)}")
+                
                 return None
 
             # Filter out responses that are too similar to the last one
@@ -335,6 +371,7 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
                     # Update global last narration
                     last_narration_per_client[sid] = clean_answer
                     no_change_count[sid] = 0  # Reset no change counter
+                    static_response_count[sid] = 0  # Reset static response counter when we get a good one
 
                     # Return the processed text (for tracking/debugging)
                     return clean_answer
