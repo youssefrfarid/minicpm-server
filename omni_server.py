@@ -68,6 +68,11 @@ print("✅ Model loaded", flush=True)
 GLOBAL_SESSION_ID = "global_session"  # Single session ID for all peers for MVP
 model_initialized = False  # Flag to track if the streaming session has been initialized
 
+# Global stores for peer connections and data channels
+pcs: Dict[str, RTCPeerConnection] = {}
+global_data_channels: Dict[str, Dict[str, RTCDataChannel]] = {}
+global_peer_data: Dict[str, Dict] = {}  # For storing peer-specific data
+
 # Track consecutive no-change responses per client
 frame_buffers: Dict[str, List[Image.Image]] = {}  # Maps peer_id -> frames
 frame_counter: Dict[str, int] = {}
