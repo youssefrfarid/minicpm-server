@@ -64,47 +64,36 @@ print("✅ Model loaded", flush=True)
 
 # ─── Global state management ───────────────────────────────────────────────
 
-# Global constants
+# ─── Global constants and configuration ───────────────────────────────────
 GLOBAL_SESSION_ID = "global_session"  # Single session ID for all peers for MVP
 model_initialized = False  # Flag to track if the streaming session has been initialized
+MAX_STATIC_RESPONSES = 3  # Maximum consecutive static responses before reset
+MAX_VIDEO_HISTORY = 30  # Tokens of history for each client
+MAX_FRAMES_IN_BATCH = 12  # Size of sliding window for frames
+NARRATION_INTERVAL = 2.0  # Interval for streaming_generate calls
+TEXT_SIMILARITY_THRESHOLD = 0.65  # Threshold for detecting similar responses
 
-# Global stores for peer connections and data channels
-pcs: Dict[str, RTCPeerConnection] = {}
-global_data_channels: Dict[str, Dict[str, RTCDataChannel]] = {}
+# ─── Global state dictionaries ───────────────────────────────────────────
+# Peer connection and WebRTC state
+pcs: Dict[str, RTCPeerConnection] = {}  # WebRTC peer connections
+global_data_channels: Dict[str, Dict[str, RTCDataChannel]] = {}  # Data channels
 global_peer_data: Dict[str, Dict] = {}  # For storing peer-specific data
 
-# Track consecutive no-change responses per client
+# Frame and narration state tracking
 frame_buffers: Dict[str, List[Image.Image]] = {}  # Maps peer_id -> frames
-frame_counter: Dict[str, int] = {}
-last_fps_log_time: Dict[str, float] = {}
-last_narration_per_client: Dict[str, str] = {}
+narration_loops: Dict[str, asyncio.Task] = {}  # Background narration tasks
+last_narration_per_client: Dict[str, str] = {}  # Previous narration text
+
+# Response quality tracking
 no_change_count: Dict[str, int] = {}  # Track consecutive "no change" responses
 static_response_count: Dict[str, int] = {}  # Track consecutive static responses
 
-# Maximum number of static responses before resetting the session
-MAX_STATIC_RESPONSES = 3
+# FPS calculation 
+frame_counter: Dict[str, int] = {}  # Count frames per peer
+last_fps_log_time: Dict[str, float] = {}  # Last FPS calculation timestamp
 
-# MiniCPM-o streaming session management
-# Using a single global session for now
-
-# Authentication store
-auth_tokens = set()
-
-# ─── Shared session state ───────────────────────────────────────────────
-MAX_VIDEO_HISTORY = 30  # tokens of history for each client
-
-# Real-time frame processing system
-frame_buffers: Dict[str, List[Image.Image]] = {}
-narration_loops: Dict[str, asyncio.Task] = {}
-MAX_FRAMES_IN_BATCH = 12  # Size of sliding window for frames
-NARRATION_INTERVAL = 2.0  # Interval for streaming_generate calls
-GLOBAL_SESSION_ID = "global_session"  # Single session ID for the model
-# MiniCPM-o streaming system state
-model_initialized = False  # Track if the model session has been initialized
-
-# For FPS calculation
-last_fps_log_time: Dict[str, float] = {}
-frame_counter: Dict[str, int] = {}
+# Authentication
+auth_tokens = set()  # Valid authentication tokens
 
 # Frame difference threshold
 TEXT_SIMILARITY_THRESHOLD = 0.65  # Further reduced to allow more variation
@@ -424,6 +413,7 @@ app = FastAPI()
 
 async def handle_start_narration(channel: RTCDataChannel, data: Dict[str, Any]):
     """Handle start narration request."""
+    global model_initialized  # Add global declaration at the top of function
     try:
         peer_id = get_peer_id_from_channel(channel)
         if not peer_id:
