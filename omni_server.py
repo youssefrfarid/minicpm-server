@@ -71,6 +71,9 @@ global_peer_data: Dict[str, Dict] = {}  # For storing peer-specific data
 last_narration_per_client: Dict[str, str] = {}
 no_change_count: Dict[str, int] = {}  # Track consecutive "no change" responses
 
+# MiniCPM-o streaming session management
+# Using a single global session for now
+
 # Authentication store
 auth_tokens = set()
 
@@ -80,9 +83,12 @@ MAX_VIDEO_HISTORY = 30  # tokens of history for each client
 # Real-time frame processing system
 frame_buffers: Dict[str, List[Image.Image]] = {}
 narration_loops: Dict[str, asyncio.Task] = {}
-MAX_FRAMES_IN_BATCH = 12  # Reduced frames for faster processing
-NARRATION_INTERVAL = 2.0  # Longer interval for more descriptive responses
+MAX_FRAMES_IN_BATCH = 12  # Size of sliding window for frames
+NARRATION_INTERVAL = 2.0  # Interval for streaming_generate calls
+GLOBAL_SESSION_ID = "global_session"  # Single session ID for the model
 
+# MiniCPM-o streaming system state
+model_initialized = False  # Track if the model session has been initialized
 
 # For FPS calculation
 last_fps_log_time: Dict[str, float] = {}
@@ -112,22 +118,33 @@ def get_peer_id_from_channel(channel: RTCDataChannel) -> str | None:
 
 
 async def narration_loop(peer_id: str):
-    """Periodically process the latest frames from the buffer."""
+    """Periodically process frames using MiniCPM-o's streaming API."""
+    # Initialize streaming session on first run
+    if not model_initialized:
+        await initialize_streaming_session()
+    
     while peer_id in pcs:
         await asyncio.sleep(NARRATION_INTERVAL)
 
         if peer_id in frame_buffers and frame_buffers[peer_id]:
-            # Copy the latest frames and clear the buffer immediately
-            # to avoid processing stale frames on the next iteration.
+            # For streaming, we don't completely clear the buffer
+            # Instead, we maintain a sliding window of the latest frames
             frames_to_process = frame_buffers[peer_id].copy()
-            frame_buffers[peer_id].clear()
+            
+            # Keep only the most recent frames for next iteration (sliding window)
+            # This maintains context while preventing memory buildup
+            if len(frame_buffers[peer_id]) > MAX_FRAMES_IN_BATCH:
+                # Remove oldest frames, keep the most recent ones
+                frames_to_keep = min(MAX_FRAMES_IN_BATCH // 2, len(frame_buffers[peer_id]))
+                frame_buffers[peer_id] = frame_buffers[peer_id][-frames_to_keep:]
 
             print(
-                f"🔄 [NARRATION_LOOP] Processing batch of {len(frames_to_process)} frames for peer {peer_id}")
-            # Process the batch without blocking the loop for too long
+                f"🔄 [NARRATION_LOOP] Processing {len(frames_to_process)} frames for peer {peer_id}")
+            
+            # Process the frames without blocking the loop
             asyncio.create_task(process_frame(peer_id, frames_to_process))
         else:
-            # This is not an error, just means no new frames arrived.
+            # No new frames arrived
             pass
 
 
@@ -151,8 +168,51 @@ def cleanup_peer_data(peer_id: str):
     print(f"🧹 [DEBUG] Cleaned up all data for peer {peer_id}")
 
 
+async def initialize_streaming_session():
+    """Initialize the MiniCPM-o streaming session.
+    Should be called once at the beginning of the application.
+    """
+    global model_initialized
+    
+    if model_initialized:
+        return True
+    
+    print("🔄 [DEBUG] Initializing MiniCPM-o streaming session...")
+    try:
+        # Reset the session to start fresh
+        model.reset_session()
+        
+        # Create a system prompt for the assistant role
+        sys_prompt = {
+            "role": "system", 
+            "content": (
+                "You are describing what a visually impaired person is currently seeing in a real-time video stream. "
+                "Describe what they are looking at in 1-2 SHORT sentences using conversational language. "
+                "Focus ONLY on main objects or people in front of the camera. Be brief and direct. "
+                "Use phrases like 'You are looking at...', 'There is... in front of you'. "
+                "Examples: 'You are looking at a laptop.' or 'There is a person typing in front of you.'"
+            )
+        }
+        
+        # Prefill the system prompt
+        model.streaming_prefill(
+            session_id=GLOBAL_SESSION_ID,
+            msgs=[sys_prompt],
+            tokenizer=tokenizer
+        )
+        
+        model_initialized = True
+        print("✅ [DEBUG] MiniCPM-o streaming session initialized")
+        return True
+    except Exception as e:
+        print(f"❌ [ERROR] Failed to initialize streaming session: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 async def _process_frame_sync(sid: str, frames: List[Image.Image]):
-    """Process a batch of frames with MiniCPM-o and send response.
+    """Process a batch of frames with MiniCPM-o streaming API.
 
     Args:
         sid: Session ID for the peer
@@ -163,33 +223,11 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
         return None
 
     print(
-        f"🔄 [DEBUG] Starting batch inference for peer {sid} with {len(frames)} frames")
+        f"🔄 [DEBUG] Processing frames for peer {sid} with {len(frames)} frames")
     print(f"🔄 [DEBUG] Frame dimensions: {frames[0].size if frames else 'N/A'}")
-
-    # Get last narration for context
+    
+    # Get last narration for context and filtering
     last_narr = last_narration_per_client.get(sid, "")
-
-    # Build context-aware prompt for multi-frame processing
-    if last_narr:
-        question = (
-            f"You are describing what a visually impaired person is currently seeing. "
-            f"Previously you mentioned: '{last_narr}'. "
-            "Now describe what they are looking at in 1-2 SHORT sentences using conversational language. "
-            "Focus ONLY on main objects or people in front of the camera. Be brief and direct. "
-            "Use phrases like 'You are looking at...', 'There is... in front of you'. "
-            "Examples: 'You are looking at a laptop.' or 'There is a person typing in front of you.'"
-        )
-        print(
-            f"🔄 [DEBUG] Using continuation prompt with last narration: '{last_narr[:50]}...'")
-    else:
-        question = (
-            "You are describing what a visually impaired person is currently seeing. "
-            "Describe what they are looking at in ONE SHORT sentence using conversational language. "
-            "Focus ONLY on the main object or person directly in front of the camera. Be brief and direct. "
-            "Use phrases like 'You are looking at...', 'There is... in front of you'. "
-            "Examples: 'You are looking at a laptop.' or 'There is a person sitting nearby.' or 'You are looking at someone's hands.'"
-        )
-        print("🔄 [DEBUG] Using initial prompt (no previous narration)")
 
     # Wait for narration channel to be ready (with timeout)
     max_wait = 5.0  # seconds
@@ -214,37 +252,57 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
 
     print(f"✅ [DEBUG] Got open narration channel for peer {sid}")
 
+    # Make sure streaming session is initialized
+    if not model_initialized:
+        init_success = await initialize_streaming_session()
+        if not init_success:
+            print("❌ [ERROR] Failed to initialize streaming session")
+            return None
+
     try:
-        # Prepare messages for the model (using GitHub implementation format)
-        msgs = [
-            {'role': 'user', 'content': frames + [question]},
-        ]
-
-        # Set decode params for video
-        params = {}
-        params["use_image_id"] = False
-        # use 1 if cuda OOM and video resolution > 448*448
-        params["max_slice_nums"] = 2
-
-        print("🔄 [DEBUG] Running model.chat()...")
-
-        # Use the simple chat method from GitHub implementation
-        answer = model.chat(
-            msgs=msgs,
+        # Prefill each frame into the model's context
+        for frame in frames:
+            # Note: Without audio, we only include the image in the content
+            msg = {"role": "user", "content": [frame]}
+            
+            # Add frame to model's streaming context
+            model.streaming_prefill(
+                session_id=GLOBAL_SESSION_ID,
+                msgs=[msg],
+                tokenizer=tokenizer,
+                max_slice_nums=1,  # Use 1 if CUDA OOM and video resolution > 448*448
+                use_image_id=False
+            )
+        
+        # Generate response from accumulated frames in the context
+        print("🔄 [DEBUG] Running model.streaming_generate()...")
+        
+        # Use the streaming generate method to get incremental responses
+        response_iterator = model.streaming_generate(
+            session_id=GLOBAL_SESSION_ID,
             tokenizer=tokenizer,
-            **params
+            temperature=0.5
         )
+        
+        # Collect the response chunks
+        clean_answer = ""
+        for response in response_iterator:
+            # Note: response format depends on if generate_audio is True
+            # We're not generating audio here, so it returns dicts
+            if isinstance(response, dict):
+                text_chunk = response.get('text', '')
+                clean_answer += text_chunk
+        
+        print(f"🔄 [DEBUG] Model streaming response: '{clean_answer}'")
 
-        print(f"🔄 [DEBUG] Model response: '{answer}'")
-
-        if answer and answer.strip():
-            clean_answer = answer.strip()
+        if clean_answer and clean_answer.strip():
+            clean_answer = clean_answer.strip()
 
             # Limit to maximum of 2 sentences to keep it brief for real-time TTS
             sentences = re.split(r'(?<=[.!?])\s+', clean_answer)
             if len(sentences) > 2:
                 clean_answer = '. '.join(sentences[:2]) + '.'
-
+            
             # Filter out unwanted static phrases
             static_phrases = ["static", "unchanged", "similar to before", "remains the same",
                               "no change", "no movement", "no new", "no different"]
@@ -259,7 +317,7 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
                     f"🗑️ [DEBUG] Discarding similar response for peer {sid}: '{clean_answer}'")
                 return None
 
-            # Send complete response directly (no word-by-word streaming)
+            # Send complete response to client
             complete_message = {
                 'type': 'complete',
                 'full_text': clean_answer,
@@ -270,57 +328,51 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
                 try:
                     narration_channel.send(json.dumps(complete_message))
                     print(
-                        f"✅ [DEBUG] Sent complete response: '{clean_answer}'")
-                except Exception as e:
+                        f"📢 [DEBUG] Sent narration to peer {sid}: '{clean_answer}'")
+
+                    # Update global last narration
+                    last_narration_per_client[sid] = clean_answer
+                    no_change_count[sid] = 0  # Reset no change counter
+
+                    # Return the processed text (for tracking/debugging)
+                    return clean_answer
+
+                except Exception as send_error:
                     print(
-                        f"⚠️ [ERROR] Error sending complete response: {str(e)}")
-
-            # Update last narration for context
-            last_narration_per_client[sid] = clean_answer
-            print(f"✅ [DEBUG] Updated last narration for peer {sid}")
-
-            return clean_answer
+                        f"⚠️ [ERROR] Failed to send message to peer {sid}: {str(send_error)}")
+            else:
+                print(
+                    f"⚠️ [DEBUG] Channel closed, cannot send narration to peer {sid}")
         else:
-            print("⚠️ [DEBUG] No response generated")
+            print(f"⚠️ [DEBUG] Empty response from model for peer {sid}")
             return None
 
     except Exception as e:
-        print(f"⚠️ [ERROR] Error during model inference: {str(e)}")
-        try:
-            narration_channel = global_data_channels.get(
-                sid, {}).get("narration")
-            if narration_channel and narration_channel.readyState == "open":
-                error_message = {
-                    "type": "error",
-                    "message": f"Error processing video: {str(e)}",
-                    "is_final": True
-                }
-                narration_channel.send(json.dumps(error_message))
-        except Exception as send_error:
-            print(f"⚠️ [ERROR] Failed to send error message: {send_error}")
-
+        print(f"⚠️ [ERROR] Frame processing error for peer {sid}: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
 async def process_frame(sid: str, frames: List[Image.Image]):
-    """Process a batch of frames and handle streaming.
+    """Process frames using MiniCPM-o's streaming API.
 
     Args:
         sid: Session ID for the peer
-        frames: List of PIL Images to process as a batch
+        frames: List of PIL Images to process as a continuous stream
     """
     print(
-        f"🎬 [DEBUG] process_frame called for peer {sid} with {len(frames)} frames")
-    print(f"🎬 [DEBUG] Starting batch streaming inference...")
+        f"🎥 [DEBUG] process_frame called for peer {sid} with {len(frames)} frames")
+    print(f"🎥 [DEBUG] Starting streaming inference...")
 
     try:
-        # Directly await the async _process_frame_sync
+        # Process frames with streaming API
         result = await _process_frame_sync(sid, frames)
         print(
-            f"🎬 [DEBUG] Batch streaming inference completed, result: {'Success' if result else 'Skipped/None'}")
+            f"🎥 [DEBUG] Streaming inference completed, result: {'Success' if result else 'Skipped/None'}")
         return result
     except Exception as e:
-        print(f"🎬 [ERROR] Error in batch processing: {str(e)}")
+        print(f"🎥 [ERROR] Error in streaming process: {str(e)}")
         return None
 
 # ─── WebRTC signalling & media ingestion ───────────────────────────────
@@ -340,6 +392,17 @@ async def handle_start_narration(channel: RTCDataChannel, data: Dict[str, Any]):
 
         print(
             f"🎬 [DEBUG] Starting narration for peer {peer_id}, client {client_id}")
+        
+        # Initialize streaming session if needed
+        if not model_initialized:
+            init_success = await initialize_streaming_session()
+            if not init_success:
+                print("❌ [ERROR] Failed to initialize streaming session")
+                channel.send(json.dumps({
+                    "type": "error",
+                    "message": "Failed to initialize model"
+                }))
+                return
 
         # Send acknowledgment
         response = {
@@ -478,12 +541,12 @@ async def offer(request: Request):
                             f"⚠️ [DEBUG] Failed to convert frame: {frame_convert_error}")
                         continue
 
-                    # Add frame to buffer, keeping it at a max size
+                    # Add frame to buffer for streaming processing
+                    # We'll maintain a sliding window in the narration_loop
                     if peer_id in frame_buffers:
                         frame_buffers[peer_id].append(pil_img)
-                        if len(frame_buffers[peer_id]) > MAX_FRAMES_IN_BATCH:
-                            # Remove oldest frame
-                            frame_buffers[peer_id].pop(0)
+                        # We allow buffer to grow slightly beyond MAX_FRAMES_IN_BATCH
+                        # narration_loop will trim it periodically
 
                 except MediaStreamError as e:
                     print(f"🔌 Video track ended for peer {peer_id}: {e}")
