@@ -80,7 +80,7 @@ MAX_VIDEO_HISTORY = 30  # tokens of history for each client
 # Real-time frame processing system
 frame_buffers: Dict[str, List[Image.Image]] = {}
 narration_loops: Dict[str, asyncio.Task] = {}
-MAX_FRAMES_IN_BATCH = 8  # Reduced frames for faster processing
+MAX_FRAMES_IN_BATCH = 12  # Reduced frames for faster processing
 NARRATION_INTERVAL = 2.0  # Longer interval for more descriptive responses
 
 
