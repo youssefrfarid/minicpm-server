@@ -173,6 +173,7 @@ async def initialize_streaming_session():
     """Initialize the MiniCPM-o streaming session.
     Should be called once at the beginning of the application.
     """
+    global model_initialized
     
     if model_initialized:
         return True
