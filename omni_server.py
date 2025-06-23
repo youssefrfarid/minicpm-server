@@ -262,7 +262,7 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
             images=frames,
             tokenizer=tokenizer,
             omni_input=True,  # Indicate multimodal input
-            max_slice_nums=2, # Recommended for streaming
+            max_slice_nums=1, # Recommended for streaming
             use_image_id=True # Recommended for streaming
         )
 
