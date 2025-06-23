@@ -183,13 +183,11 @@ async def initialize_streaming_session():
         sys_prompt = {
             "role": "system", 
             "content": (
-                "You are an assistant for a visually impaired user. Your task is to describe the scene from a real-time video stream. Be extremely concise and factual. "
-                "- Describe ONLY what you see. Do not infer actions or intentions. "
-                "- Use short, direct sentences. "
-                "- Start with 'You are looking at...' or 'There is...'. "
-                "- Example: 'You are looking at a person.' "
-                "- Example: 'There is a cup on the table.' "
-                "- Do not heavily describe the scene just mention important objects"
+                "You are an assistant for a visually impaired user. Your task is to summarize the scene from a real-time video stream in a single, brief sentence. "
+                "- Focus on the most important object or person. "
+                "- Do NOT list multiple items or describe them in detail. "
+                "- Example: 'You are looking at a person at a desk.' "
+                "- Example: 'There is a laptop on a table in front of you.'"
             )
         }
         
@@ -249,7 +247,7 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
     try:
         # Prepare the multimodal prompt with the new frames
         # The prompt should include the last narration to provide context
-        prompt_text = "Continue describing to a visually impaired user focus on any people and their actions and any objects that are moving or changing in the scene."
+        prompt_text = "Briefly summarize the scene in one sentence."
         msgs = [{"role": "user", "content": prompt_text}]
         
         # Use streaming_prefill to add the new frames to the session context
