@@ -69,10 +69,9 @@ print("✅ Model loaded", flush=True)
 GLOBAL_SESSION_ID = "global_session"  # Single session ID for all peers for MVP
 model_initialized = False  # Flag to track if the streaming session has been initialized
 MAX_STATIC_RESPONSES = 3  # Maximum consecutive static responses before reset
-MAX_VIDEO_HISTORY = 30  # Tokens of history for each client
-MAX_FRAMES_IN_BATCH = 12  # Size of sliding window for frames
-NARRATION_INTERVAL = 2.0  # Interval for streaming_generate calls
-TEXT_SIMILARITY_THRESHOLD = 0.65  # Threshold for detecting similar responses
+MAX_FRAMES_IN_BATCH = 12  # Number of frames to collect before processing
+NARRATION_INTERVAL = 1.0  # Interval to check for a new batch of frames
+TEXT_SIMILARITY_THRESHOLD = 0.85  # Threshold for detecting similar responses to avoid repetition
 
 # ─── Global state dictionaries ───────────────────────────────────────────
 # Peer connection and WebRTC state
@@ -85,10 +84,7 @@ frame_buffers: Dict[str, List[Image.Image]] = {}  # Maps peer_id -> frames
 narration_loops: Dict[str, asyncio.Task] = {}  # Background narration tasks
 last_narration_per_client: Dict[str, str] = {}  # Previous narration text
 
-# Response quality tracking
-static_response_count: Dict[str, int] = {}  # Track consecutive static responses
-
-# FPS calculation 
+# FPS calculation
 frame_counter: Dict[str, int] = {}  # Count frames per peer
 last_fps_log_time: Dict[str, float] = {}  # Last FPS calculation timestamp
 
@@ -116,249 +112,97 @@ def get_peer_id_from_channel(channel: RTCDataChannel) -> str | None:
 
 
 async def narration_loop(peer_id: str):
-    """Periodically process frames using MiniCPM-o's streaming API."""
-    # Initialize streaming session on first run
-    if not model_initialized:
-        await initialize_streaming_session()
-    
+    """Periodically process frames using MiniCPM-o's chat API in batches."""
     while peer_id in pcs:
         await asyncio.sleep(NARRATION_INTERVAL)
 
-        if peer_id in frame_buffers and frame_buffers[peer_id]:
-            # For streaming, we don't completely clear the buffer
-            # Instead, we maintain a sliding window of the latest frames
-            frames_to_process = frame_buffers[peer_id].copy()
-            
-            # Keep only the most recent frames for next iteration (sliding window)
-            # This maintains context while preventing memory buildup
-            if len(frame_buffers[peer_id]) > MAX_FRAMES_IN_BATCH:
-                # Remove oldest frames, keep the most recent ones
-                frames_to_keep = min(MAX_FRAMES_IN_BATCH // 2, len(frame_buffers[peer_id]))
-                frame_buffers[peer_id] = frame_buffers[peer_id][-frames_to_keep:]
+        if peer_id in frame_buffers and len(frame_buffers[peer_id]) >= MAX_FRAMES_IN_BATCH:
+            # Take a batch of frames from the buffer
+            frames_to_process = frame_buffers[peer_id][:MAX_FRAMES_IN_BATCH]
+            # Remove the processed frames from the buffer
+            frame_buffers[peer_id] = frame_buffers[peer_id][MAX_FRAMES_IN_BATCH:]
 
             print(
-                f"🔄 [NARRATION_LOOP] Processing {len(frames_to_process)} frames for peer {peer_id}")
-            
+                f"🔄 [NARRATION_LOOP] Processing a batch of {len(frames_to_process)} frames for peer {peer_id}")
+
             # Process the frames without blocking the loop
-            asyncio.create_task(process_frame(peer_id, frames_to_process))
+            asyncio.create_task(process_frames_batch(peer_id, frames_to_process))
         else:
-            # No new frames arrived
+            # Not enough frames for a batch yet
             pass
 
 
 def cleanup_peer_data(peer_id: str):
     """Clean up all data for a peer."""
-    # Cancel the narration loop
-    if peer_id in narration_loops:
-        narration_loops[peer_id].cancel()
-        narration_loops.pop(peer_id, None)
-
-    # Clear frame buffer
+    print(f"🧹 Cleaning up data for peer {peer_id}")
+    narration_task = narration_loops.pop(peer_id, None)
+    if narration_task:
+        narration_task.cancel()
     frame_buffers.pop(peer_id, None)
-
-    # Clear other peer data
     last_narration_per_client.pop(peer_id, None)
     global_data_channels.pop(peer_id, None)
     last_fps_log_time.pop(peer_id, None)
     frame_counter.pop(peer_id, None)
-
     print(f"🧹 [DEBUG] Cleaned up all data for peer {peer_id}")
 
 
-async def initialize_streaming_session():
-    """Initialize the MiniCPM-o streaming session.
-    Should be called once at the beginning of the application.
-    """
-    global model_initialized
-    
-    if model_initialized:
-        return True
-    
-    print("🔄 [DEBUG] Initializing MiniCPM-o streaming session...")
-    try:
-        # Reset the session and prefill the concise system prompt once
-        model.reset_session()
-        sys_prompt = {
-            "role": "system",
-            "content": (
-                "You are an assistant for a visually impaired user. "
-                "Your task is to summarize the scene from a real-time video stream in a single, brief sentence. "
-                "- Focus on the most important object or person. "
-                "- Do NOT list multiple items or describe them in detail."
-            )
-        }
-        model.streaming_prefill(
-            session_id=GLOBAL_SESSION_ID,
-            msgs=[sys_prompt],
-            tokenizer=tokenizer,
-            omni_input=True,
-            max_slice_nums=1,
-            use_image_id=True
-        )
-
-        model_initialized = True
-        print("✅ [DEBUG] MiniCPM-o streaming session initialized")
-        return True
-    except Exception as e:
-        print(f"❌ [ERROR] Failed to initialize streaming session: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-
-async def _process_frame_sync(sid: str, frames: List[Image.Image]):
-    """Process a batch of frames with MiniCPM-o streaming API.
-
-    Args:
-        sid: Session ID for the peer
-        frames: List of PIL Images to process as a batch (should be in chronological order)
-    """
-    global model_initialized
+def _process_frames_batch_sync(sid: str, frames: List[Image.Image]):
+    """Process a batch of frames with MiniCPM-o chat API. Runs in a separate thread."""
     if not frames:
-        print("⚠️ [DEBUG] No frames provided to _process_frame_sync")
+        print("⚠️ [DEBUG] No frames provided to _process_frames_batch_sync")
         return None
 
-    print(
-        f"🔄 [DEBUG] Processing frames for peer {sid} with {len(frames)} frames")
-    print(f"🔄 [DEBUG] Frame dimensions: {frames[0].size if frames else 'N/A'}")
-    
-    # Get last narration for context and filtering
     last_narration = last_narration_per_client.get(sid, "")
+    prompt_text = (
+        f"You are an assistant for a visually impaired user. "
+        "Your task is to summarize the scene from a real-time video stream in a single, brief sentence. "
+        "- Focus on the most important object or person. "
+        "- Do NOT list multiple items or describe them in detail."
+        f"Describe only what has changed since the previous description: '{last_narration}'. "
+        "One concise sentence."
+    )
 
-    # Wait for narration channel to be ready (with timeout)
-    max_wait = 5.0  # seconds
-    start_time = time.time()
-    narration_channel = None
-
-    while time.time() - start_time < max_wait:
-        narration_channel = global_data_channels.get(sid, {}).get("narration")
-        if narration_channel and narration_channel.readyState == "open":
-            break
-        await asyncio.sleep(0.1)  # Small delay to prevent busy waiting
-
-    if not narration_channel or narration_channel.readyState != "open":
-        print(
-            f"⚠️ [DEBUG] Narration channel not open or not found for peer {sid} after {max_wait} seconds")
-        return None
-    print(f"✅ [DEBUG] Got open narration channel for peer {sid}")
+    # The user message is a combination of the prompt and the frames
+    msgs = [{'role': 'user', 'content': [prompt_text] + frames}]
 
     try:
-        
-        # Prepare the multimodal prompt focusing on changes since the last narration
-        prompt_text = (
-            f"Describe only what has changed since the previous description: '{last_narration}'. "
-            "One concise sentence."
-        )
-
-        # Build the flattened content list per MiniCPM-o multimodal format
-        content_list = [prompt_text]
-        for frame in frames:
-            content_list.append("<unit>")
-            content_list.append(frame)
-
-        msgs = [{"role": "user", "content": content_list}]
-        
-        # Use a single streaming_prefill call with the combined content
-        model.streaming_prefill(
-            session_id=GLOBAL_SESSION_ID,
+        # Call the model's chat function
+        answer = model.chat(
             msgs=msgs,
             tokenizer=tokenizer,
-            omni_input=True,
-            max_slice_nums=1, # This might need tuning
-            use_image_id=True
-        )
-
-        # Generate the narration using the streaming API
-        print("🔄 [DEBUG] Running model.streaming_generate()...")
-        response_iterator = model.streaming_generate(
-            session_id=GLOBAL_SESSION_ID,
-            tokenizer=tokenizer,
             temperature=0.1,
-            generate_audio=False  # Disable audio generation to avoid tts_processor error
+            # Add any other parameters for model.chat here
         )
 
-        # Process the streaming response
-        complete_response = ""
-        for new_text in response_iterator:
-            if isinstance(new_text, dict):
-                text_chunk = new_text.get('text', '')
-                complete_response += text_chunk
-            else:
-                complete_response += new_text
-
-        if not complete_response:
+        if not answer:
             print("🗑️ [DEBUG] Empty response from model")
             return None
 
-        print(f"🔄 [DEBUG] Model streaming response: '{complete_response}'")
-
         # Clean up the response
-        clean_answer = complete_response.replace('<|tts_eos|>', '').strip()
+        clean_answer = answer.replace('<|tts_eos|>', '').strip()
         if not clean_answer:
             return None
 
         # Compare with the last narration to filter static/repetitive responses
-        last_narration = last_narration_per_client.get(sid, "")
-        if last_narration:
-            similarity = fuzz.ratio(clean_answer.lower(), last_narration.lower()) / 100.0
-            print(f"🔎 [SIMILARITY] Comparing:\n"
-                  f"  - New: '{clean_answer}'\n"
-                  f"  - Last: '{last_narration}'\n"
-                  f"  - Similarity: {similarity:.2f}")
-
-            # If the new narration is too similar, increment static counter
-            if similarity > TEXT_SIMILARITY_THRESHOLD:
-                static_response_count[sid] = static_response_count.get(sid, 0) + 1
-                print(f"⚠️ [DEBUG] Static response detected for peer {sid} (Count: {static_response_count[sid]})")
-
-                # Check if we've had too many static responses in a row
-                if static_response_count[sid] >= MAX_STATIC_RESPONSES:
-                    print(f"⚠️ [WARNING] Too many static responses for peer {sid}, resetting streaming session")
-                    try:
-                        model_initialized = False
-                        model.reset_session()
-                        await initialize_streaming_session()
-                        
-                        if sid in frame_buffers and len(frame_buffers[sid]) > 0:
-                            frames_to_keep = min(5, len(frame_buffers[sid]))
-                            frame_buffers[sid] = frame_buffers[sid][-frames_to_keep:]
-                            print(f"🔄 [DEBUG] Frame buffer partially cleared for peer {sid}, keeping {frames_to_keep} frames")
-                        
-                        static_response_count[sid] = 0
-                    except Exception as e:
-                        print(f"❌ [ERROR] Failed to reset session: {str(e)}")
-                    return None # Stop processing this response after reset
-
-                # Also skip sending the message if it's almost identical to prevent spam
-                if similarity > TEXT_SIMILARITY_THRESHOLD: 
-                    print(f"🗑️ [DEBUG] Skipping identical narration for peer {sid}.")
-                    return None
-            else:
-                # Reset counter if response is different enough
-                static_response_count[sid] = 0
+        if are_texts_similar(clean_answer, last_narration):
+            print(f"🗑️ [DEBUG] Skipping similar narration for peer {sid}.")
+            return None
 
         # Send the narration to the client
+        narration_channel = global_data_channels.get(sid, {}).get("narration")
         if narration_channel and narration_channel.readyState == "open":
-            # Truncate for display if too long
-            display_text = (clean_answer[:60] + '..') if len(clean_answer) > 60 else clean_answer
-            
-            # Send the complete message over the data channel
             complete_message = {
                 "type": "narration",
                 "text": clean_answer
             }
             narration_channel.send(json.dumps(complete_message))
+            display_text = (clean_answer[:60] + '..') if len(clean_answer) > 60 else clean_answer
             print(
                 f"📢 [DEBUG] Sent narration to peer {sid}: '{display_text}'")
 
             # Update global last narration
             last_narration_per_client[sid] = clean_answer
-            static_response_count[sid] = 0  # Reset static response counter when we get a good one
-
-            # Return the processed text (for tracking/debugging)
             return clean_answer
-
-            return None
 
     except Exception as e:
         print(f"⚠️ [ERROR] Frame processing error for peer {sid}: {str(e)}")
@@ -367,25 +211,25 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
         return None
 
 
-async def process_frame(sid: str, frames: List[Image.Image]):
-    """Process frames using MiniCPM-o's streaming API.
-
-    Args:
-        sid: Session ID for the peer
-        frames: List of PIL Images to process as a continuous stream
-    """
+async def process_frames_batch(sid: str, frames: List[Image.Image]):
+    """Process a batch of frames using MiniCPM-o's chat API in a separate thread."""
     print(
-        f"🎥 [DEBUG] process_frame called for peer {sid} with {len(frames)} frames")
-    print(f"🎥 [DEBUG] Starting streaming inference...")
+        f"🎥 [DEBUG] process_frames_batch called for peer {sid} with {len(frames)} frames")
 
     try:
-        # Process frames with streaming API
-        result = await _process_frame_sync(sid, frames)
+        # Run the synchronous model call in a separate thread
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,  # Use the default thread pool executor
+            _process_frames_batch_sync,
+            sid,
+            frames
+        )
         print(
-            f"🎥 [DEBUG] Streaming inference completed, result: {'Success' if result else 'Skipped/None'}")
+            f"🎥 [DEBUG] Batch inference completed, result: {'Success' if result else 'Skipped/None'}")
         return result
     except Exception as e:
-        print(f"🎥 [ERROR] Error in streaming process: {str(e)}")
+        print(f"🎥 [ERROR] Error in batch processing: {str(e)}")
         return None
 
 # ─── WebRTC signalling & media ingestion ───────────────────────────────
