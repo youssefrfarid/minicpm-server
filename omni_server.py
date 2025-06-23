@@ -249,36 +249,26 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
 
     try:
         # Prepare the multimodal prompt with the new frames
-        # The prompt should include the last narration to provide context
-        prompt_text = (
-                "You are an assistant for a visually impaired user. Your task is to summarize the scene from a real-time video stream in a single, brief sentence. "
-                "- Focus on the most important object or person. "
-                "- Do NOT list multiple items or describe them in detail. "
-                "- Example: 'You are looking at a person at a desk.' "
-                "- Example: 'There is a laptop on a table in front of you.'"
-            )
-        msgs = [{"role": "system", "content": prompt_text}]
+        prompt_text = "Briefly summarize the scene in one sentence."
+
+        # The documentation suggests creating a flattened list of the prompt, 
+        # special <unit> tokens, and image objects.
+        content_list = [prompt_text]
+        for frame in frames:
+            content_list.append("<unit>")
+            content_list.append(frame)
+
+        msgs = [{"role": "user", "content": content_list}]
         
-        # Use streaming_prefill to add the new frames to the session context
+        # Use a single streaming_prefill call with the combined content
         model.streaming_prefill(
             session_id=GLOBAL_SESSION_ID,
             msgs=msgs,
             tokenizer=tokenizer,
-            omni_input=True,  # Indicate multimodal input
-            max_slice_nums=1, # Recommended for streaming
-            use_image_id=True # Recommended for streaming
+            omni_input=True,
+            max_slice_nums=1, # This might need tuning
+            use_image_id=True
         )
-
-        for content in frames:
-            msgs = [{"role":"user", "content": content}]
-            model.streaming_prefill(
-                session_id=GLOBAL_SESSION_ID,
-                msgs=msgs, 
-                tokenizer=tokenizer,
-                omni_input=True,  # Indicate multimodal input
-                max_slice_nums=1, # Recommended for streaming
-                use_image_id=True # Recommended for streaming
-            )
 
         # Generate the narration using the streaming API
         print("🔄 [DEBUG] Running model.streaming_generate()...")
