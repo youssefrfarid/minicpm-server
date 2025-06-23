@@ -219,6 +219,7 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
         sid: Session ID for the peer
         frames: List of PIL Images to process as a batch (should be in chronological order)
     """
+    global model_initialized
     if not frames:
         print("⚠️ [DEBUG] No frames provided to _process_frame_sync")
         return None
@@ -241,141 +242,125 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
             break
         await asyncio.sleep(0.1)  # Small delay to prevent busy waiting
 
-    if not narration_channel:
+    if not narration_channel or narration_channel.readyState != "open":
         print(
-            f"⚠️ [DEBUG] No narration channel found for peer {sid} after {max_wait} seconds")
+            f"⚠️ [DEBUG] Narration channel not open or not found for peer {sid} after {max_wait} seconds")
         return None
-
-    if narration_channel.readyState != "open":
-        print(
-            f"⚠️ [DEBUG] Narration channel not open for peer {sid} after {max_wait} seconds")
-        return None
-
+    
+    global model_initialized
     print(f"✅ [DEBUG] Got open narration channel for peer {sid}")
 
-    # Make sure streaming session is initialized
-    if not model_initialized:
-        init_success = await initialize_streaming_session()
-        if not init_success:
-            print("❌ [ERROR] Failed to initialize streaming session")
-            return None
-
     try:
-        # Prefill each frame into the model's context
-        for frame in frames:
-            # Note: Without audio, we only include the image in the content
-            msg = {"role": "user", "content": [frame]}
-            
-            # Add frame to model's streaming context
-            model.streaming_prefill(
-                session_id=GLOBAL_SESSION_ID,
-                msgs=[msg],
-                tokenizer=tokenizer,
-                max_slice_nums=1,  # Use 1 if CUDA OOM and video resolution > 448*448
-                use_image_id=False
-            )
+        # Prepare the multimodal prompt with the new frames
+        # The prompt should include the last narration to provide context
+        prompt_text = f"Continue from here: {last_narration}"
+        msgs = [{"role": "user", "content": prompt_text}]
         
-        # Generate response from accumulated frames in the context
+        # Use streaming_prefill to add the new frames to the session context
+        model.streaming_prefill(
+            session_id=GLOBAL_SESSION_ID,
+            msgs=msgs,
+            images=frames,
+            tokenizer=tokenizer,
+            omni_input=True,  # Indicate multimodal input
+            max_slice_nums=3, # Recommended for streaming
+            use_image_id=True # Recommended for streaming
+        )
+
+        # Generate the narration using the streaming API
         print("🔄 [DEBUG] Running model.streaming_generate()...")
-        
-        # Use the streaming generate method to get incremental responses
-        # Explicitly disable audio generation to avoid tts_processor error
         response_iterator = model.streaming_generate(
             session_id=GLOBAL_SESSION_ID,
             tokenizer=tokenizer,
             temperature=0.5,
             generate_audio=False  # Disable audio generation to avoid tts_processor error
         )
+
+        # Process the streaming response
+        complete_response = ""
+        for new_text in response_iterator:
+            complete_response += new_text
+
+        if not complete_response:
+            print("🗑️ [DEBUG] Empty response from model")
+            return None
+
+        print(f"🔄 [DEBUG] Model streaming response: '{complete_response}'")
+
+        # Clean up the response
+        clean_answer = complete_response.replace('<|tts_eos|>', '').strip()
+        if not clean_answer:
+            return None
+
+        # Filter out unwanted static phrases
+        static_phrases = ["static", "unchanged", "similar to before", "remains the same",
+                            "no change", "no movement", "no new", "no different"]
         
-        # Collect the response chunks
-        clean_answer = ""
-        for response in response_iterator:
-            # Note: response format depends on if generate_audio is True
-            # We're not generating audio here, so it returns dicts
-            if isinstance(response, dict):
-                text_chunk = response.get('text', '')
-                clean_answer += text_chunk
+        # Check if the response is static
+        is_static = any(phrase in clean_answer.lower() for phrase in static_phrases)
         
-        print(f"🔄 [DEBUG] Model streaming response: '{clean_answer}'")
-
-        if clean_answer and clean_answer.strip():
-            clean_answer = clean_answer.strip()
-
-            # Limit to maximum of 2 sentences to keep it brief for real-time TTS
-            sentences = re.split(r'(?<=[.!?])\s+', clean_answer)
-            if len(sentences) > 2:
-                clean_answer = '. '.join(sentences[:2]) + '.'
+        if is_static:
+            # Increment the static response counter for this peer
+            static_response_count[sid] = static_response_count.get(sid, 0) + 1
+            print(f"🗑️ [DEBUG] Discarding static response for peer {sid} (count: {static_response_count[sid]}): '{clean_answer}'")
             
-            # Filter out unwanted static phrases
-            static_phrases = ["static", "unchanged", "similar to before", "remains the same",
-                              "no change", "no movement", "no new", "no different"]
-            
-            # Check if the response is static
-            is_static = any(phrase in clean_answer.lower() for phrase in static_phrases)
-            
-            if is_static:
-                # Increment the static response counter for this peer
-                static_response_count[sid] = static_response_count.get(sid, 0) + 1
-                print(f"🗑️ [DEBUG] Discarding static response for peer {sid} (count: {static_response_count[sid]}): '{clean_answer}'")
-                
-                # Check if we've had too many static responses in a row
-                if static_response_count[sid] >= MAX_STATIC_RESPONSES:
-                    print(f"⚠️ [WARNING] Too many static responses for peer {sid}, resetting streaming session")
-                    # Reset the session
-                    try:
-                        model_initialized = False  # Force re-initialization
-                        model.reset_session()  # Clean slate
-                        await initialize_streaming_session()  # Re-initialize with system prompt
-                        
-                        # Clear part of the frame buffer to get fresh frames
-                        if sid in frame_buffers and len(frame_buffers[sid]) > 0:
-                            # Keep only the most recent frames
-                            frames_to_keep = min(5, len(frame_buffers[sid]))
-                            frame_buffers[sid] = frame_buffers[sid][-frames_to_keep:]
-                            print(f"🔄 [DEBUG] Frame buffer partially cleared for peer {sid}, keeping {frames_to_keep} frames")
-                        
-                        # Reset the static response counter
-                        static_response_count[sid] = 0
-                    except Exception as e:
-                        print(f"❌ [ERROR] Failed to reset session: {str(e)}")
-                
-                return None
-
-            # Filter out responses that are too similar to the last one
-            if are_texts_similar(clean_answer, last_narr):
-                print(
-                    f"🗑️ [DEBUG] Discarding similar response for peer {sid}: '{clean_answer}'")
-                return None
-
-            # Send complete response to client
-            complete_message = {
-                'type': 'complete',
-                'full_text': clean_answer,
-                'is_final': True
-            }
-
-            if narration_channel.readyState == "open":
+            # Check if we've had too many static responses in a row
+            if static_response_count[sid] >= MAX_STATIC_RESPONSES:
+                print(f"⚠️ [WARNING] Too many static responses for peer {sid}, resetting streaming session")
+                # Reset the session
                 try:
-                    narration_channel.send(json.dumps(complete_message))
+                    model_initialized = False  # Force re-initialization
+                    model.reset_session()  # Clean slate
+                    await initialize_streaming_session()  # Re-initialize with system prompt
+                    
+                    # Clear part of the frame buffer to get fresh frames
+                    if sid in frame_buffers and len(frame_buffers[sid]) > 0:
+                        # Keep only the most recent frames
+                        frames_to_keep = min(5, len(frame_buffers[sid]))
+                        frame_buffers[sid] = frame_buffers[sid][-frames_to_keep:]
+                        print(f"🔄 [DEBUG] Frame buffer partially cleared for peer {sid}, keeping {frames_to_keep} frames")
+                    
+                    # Reset the static response counter
+                    static_response_count[sid] = 0
+                except Exception as e:
+                    print(f"❌ [ERROR] Failed to reset session: {str(e)}")
+            
+            return None
+
+        # Filter out responses that are too similar to the last one
+        if last_narration:
+            similarity = fuzz.ratio(clean_answer.lower(), last_narration.lower()) / 100.0
+            if similarity > TEXT_SIMILARITY_THRESHOLD:
+                no_change_count[sid] = no_change_count.get(sid, 0) + 1
+                if no_change_count[sid] >= 2:
                     print(
-                        f"📢 [DEBUG] Sent narration to peer {sid}: '{clean_answer}'")
-
-                    # Update global last narration
-                    last_narration_per_client[sid] = clean_answer
-                    no_change_count[sid] = 0  # Reset no change counter
-                    static_response_count[sid] = 0  # Reset static response counter when we get a good one
-
-                    # Return the processed text (for tracking/debugging)
-                    return clean_answer
-
-                except Exception as send_error:
-                    print(
-                        f"⚠️ [ERROR] Failed to send message to peer {sid}: {str(send_error)}")
+                        f"🗑️ [DEBUG] Discarding highly similar response for peer {sid} (sim: {similarity:.2f}): '{clean_answer}'")
+                    return None
             else:
-                print(
-                    f"⚠️ [DEBUG] Channel closed, cannot send narration to peer {sid}")
-        else:
-            print(f"⚠️ [DEBUG] Empty response from model for peer {sid}")
+                no_change_count[sid] = 0
+
+        # Send the narration to the client
+        if narration_channel and narration_channel.readyState == "open":
+            # Truncate for display if too long
+            display_text = (clean_answer[:60] + '..') if len(clean_answer) > 60 else clean_answer
+            
+            # Send the complete message over the data channel
+            complete_message = {
+                "type": "narration",
+                "text": clean_answer
+            }
+            narration_channel.send(json.dumps(complete_message))
+            print(
+                f"📢 [DEBUG] Sent narration to peer {sid}: '{display_text}'")
+
+            # Update global last narration
+            last_narration_per_client[sid] = clean_answer
+            no_change_count[sid] = 0  # Reset no change counter
+            static_response_count[sid] = 0  # Reset static response counter when we get a good one
+
+            # Return the processed text (for tracking/debugging)
+            return clean_answer
+
             return None
 
     except Exception as e:
