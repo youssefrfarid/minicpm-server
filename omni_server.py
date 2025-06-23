@@ -368,7 +368,7 @@ async def offer(request: Request):
         frame_counter[peer_id] = 0
         last_fps_log_time[peer_id] = time.time()
         last_narration_per_client[peer_id] = ""
-
+        track_frame_counter = 0
         # Start the narration loop for this peer
         if peer_id not in peer_data or peer_data[peer_id]["narration_task"] is None or peer_data[peer_id]["narration_task"].done():
             loop = asyncio.get_event_loop()
