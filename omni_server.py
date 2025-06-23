@@ -229,7 +229,7 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
     print(f"🔄 [DEBUG] Frame dimensions: {frames[0].size if frames else 'N/A'}")
     
     # Get last narration for context and filtering
-    last_narr = last_narration_per_client.get(sid, "")
+    last_narration = last_narration_per_client.get(sid, "")
 
     # Wait for narration channel to be ready (with timeout)
     max_wait = 5.0  # seconds
@@ -246,8 +246,6 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
         print(
             f"⚠️ [DEBUG] Narration channel not open or not found for peer {sid} after {max_wait} seconds")
         return None
-    
-    global model_initialized
     print(f"✅ [DEBUG] Got open narration channel for peer {sid}")
 
     try:
