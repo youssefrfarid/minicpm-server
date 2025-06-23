@@ -33,6 +33,7 @@ import json
 import re
 from typing import Dict, Optional, List, Any
 from difflib import SequenceMatcher
+from fuzzywuzzy import fuzz
 
 import cv2
 import numpy as np
@@ -261,7 +262,7 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
             images=frames,
             tokenizer=tokenizer,
             omni_input=True,  # Indicate multimodal input
-            max_slice_nums=3, # Recommended for streaming
+            max_slice_nums=2, # Recommended for streaming
             use_image_id=True # Recommended for streaming
         )
 
@@ -270,7 +271,7 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
         response_iterator = model.streaming_generate(
             session_id=GLOBAL_SESSION_ID,
             tokenizer=tokenizer,
-            temperature=0.5,
+            temperature=0.2,
             generate_audio=False  # Disable audio generation to avoid tts_processor error
         )
 
@@ -529,10 +530,6 @@ async def offer(request: Request):
                     frame = await track.recv()
                     frame_counter[peer_id] += 1
                     track_frame_counter += 1
-
-                    # Skip frames to reduce processing load (process every 2nd frame)
-                    if track_frame_counter % 2 != 0:
-                        continue
 
                     # Log FPS periodically
                     current_time = time.time()
