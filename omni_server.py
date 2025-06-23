@@ -86,7 +86,6 @@ narration_loops: Dict[str, asyncio.Task] = {}  # Background narration tasks
 last_narration_per_client: Dict[str, str] = {}  # Previous narration text
 
 # Response quality tracking
-no_change_count: Dict[str, int] = {}  # Track consecutive "no change" responses
 static_response_count: Dict[str, int] = {}  # Track consecutive static responses
 
 # FPS calculation 
@@ -95,9 +94,6 @@ last_fps_log_time: Dict[str, float] = {}  # Last FPS calculation timestamp
 
 # Authentication
 auth_tokens = set()  # Valid authentication tokens
-
-# Frame difference threshold
-TEXT_SIMILARITY_THRESHOLD = 0.65  # Further reduced to allow more variation
 
 
 # ─── Helper functions ───────────────────────────────────────────────────
@@ -188,11 +184,13 @@ async def initialize_streaming_session():
         sys_prompt = {
             "role": "system", 
             "content": (
-                "You are describing what a visually impaired person is currently seeing in a real-time video stream. "
-                "Describe what they are looking at in 1-2 SHORT sentences using conversational language. "
-                "Focus ONLY on main objects or people in front of the camera. Be brief and direct. "
-                "Use phrases like 'You are looking at...', 'There is... in front of you'. "
-                "Examples: 'You are looking at a laptop.' or 'There is a person waving at you.'"
+                "You are an assistant for a visually impaired user. Your task is to describe the scene from a real-time video stream. Be extremely concise and factual. "
+                "- Describe ONLY what you see. Do not infer actions or intentions. "
+                "- Use 1 short, direct sentence. "
+                "- Start with 'You are looking at...' or 'There is...'. "
+                "- Example: 'You are looking at a person.' "
+                "- Example: 'There is a cup on the table.' "
+                "- Do NOT add conversational filler or descriptive adjectives unless absolutely certain."
             )
         }
         
@@ -252,7 +250,7 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
     try:
         # Prepare the multimodal prompt with the new frames
         # The prompt should include the last narration to provide context
-        prompt_text = f"Continue from here: {last_narration}"
+        prompt_text = "Describe the latest changes in the scene."
         msgs = [{"role": "user", "content": prompt_text}]
         
         # Use streaming_prefill to add the new frames to the session context
@@ -271,7 +269,7 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
         response_iterator = model.streaming_generate(
             session_id=GLOBAL_SESSION_ID,
             tokenizer=tokenizer,
-            temperature=0.2,
+            temperature=0.1,
             generate_audio=False  # Disable audio generation to avoid tts_processor error
         )
 
@@ -351,7 +349,6 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
 
             # Update global last narration
             last_narration_per_client[sid] = clean_answer
-            no_change_count[sid] = 0  # Reset no change counter
             static_response_count[sid] = 0  # Reset static response counter when we get a good one
 
             # Return the processed text (for tracking/debugging)
