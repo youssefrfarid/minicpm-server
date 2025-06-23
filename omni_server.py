@@ -158,7 +158,6 @@ def cleanup_peer_data(peer_id: str):
 
     # Clear other peer data
     last_narration_per_client.pop(peer_id, None)
-    no_change_count.pop(peer_id, None)
     global_data_channels.pop(peer_id, None)
     last_fps_log_time.pop(peer_id, None)
     frame_counter.pop(peer_id, None)
@@ -186,11 +185,11 @@ async def initialize_streaming_session():
             "content": (
                 "You are an assistant for a visually impaired user. Your task is to describe the scene from a real-time video stream. Be extremely concise and factual. "
                 "- Describe ONLY what you see. Do not infer actions or intentions. "
-                "- Use 1 short, direct sentence. "
+                "- Use short, direct sentences. "
                 "- Start with 'You are looking at...' or 'There is...'. "
                 "- Example: 'You are looking at a person.' "
                 "- Example: 'There is a cup on the table.' "
-                "- Do NOT add conversational filler or descriptive adjectives unless absolutely certain."
+                "- Do not heavily describe the scene just mention important objects"
             )
         }
         
@@ -250,7 +249,7 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
     try:
         # Prepare the multimodal prompt with the new frames
         # The prompt should include the last narration to provide context
-        prompt_text = "Describe the latest changes in the scene."
+        prompt_text = "Continue describing to a visually impaired user focus on any people and their actions and any objects that are moving or changing in the scene."
         msgs = [{"role": "user", "content": prompt_text}]
         
         # Use streaming_prefill to add the new frames to the session context
