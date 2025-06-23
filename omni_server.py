@@ -129,7 +129,9 @@ async def narration_loop(peer_id: str):
 
 
 def _process_frames_batch_sync(peer_id: str, frames: List[Image.Image]):
-    """Process a batch of frames with MiniCPM-o chat API. Runs in a separate thread."""
+    """Process a batch of frames with MiniCPM-o chat API. Runs in a separate thread.
+    Returns the generated narration text if successful, None otherwise.
+    """
     if not frames:
         print("⚠️ [DEBUG] No frames provided to _process_frames_batch_sync")
         return None
@@ -174,21 +176,8 @@ def _process_frames_batch_sync(peer_id: str, frames: List[Image.Image]):
             print(f"🗑️ [DEBUG] Skipping similar narration for peer {peer_id}.")
             return None
 
-        # Send the narration to the client
-        narration_channel = global_data_channels.get(peer_id, {}).get("narration")
-        if narration_channel and narration_channel.readyState == "open":
-            complete_message = {
-                "type": "narration",
-                "text": clean_answer
-            }
-            narration_channel.send(json.dumps(complete_message))
-            display_text = (clean_answer[:60] + '..') if len(clean_answer) > 60 else clean_answer
-            print(
-                f"📢 [DEBUG] Sent narration to peer {peer_id}: '{display_text}'")
-
-            # Update global last narration
-            last_narration_per_client[peer_id] = clean_answer
-            return clean_answer
+        # Just return the clean answer; the async function will handle sending it
+        return clean_answer
 
     except Exception as e:
         print(f"⚠️ [ERROR] Frame processing error for peer {peer_id}: {str(e)}")
@@ -206,18 +195,37 @@ async def process_frames_batch(peer_id: str, frames: List[Image.Image]):
     async with model_inference_lock:
         print(f"🎥 [DEBUG] process_frames_batch called for peer {peer_id} with {len(frames)} frames")
         loop = asyncio.get_running_loop()
-        result = None
+        narration = None
         try:
-            result = await loop.run_in_executor(
+            narration = await loop.run_in_executor(
                 None, _process_frames_batch_sync, peer_id, frames
             )
+            
+            # If we got a narration back, send it to the client
+            if narration:
+                # Send the narration to the client
+                narration_channel = global_data_channels.get(peer_id, {}).get("narration")
+                if narration_channel and narration_channel.readyState == "open":
+                    complete_message = {
+                        "type": "narration",
+                        "text": narration
+                    }
+                    print(f"🎥 [DEBUG] Sending narration to peer {peer_id}: '{narration}'")
+                    narration_channel.send(json.dumps(complete_message))
+                    display_text = (narration[:60] + '..') if len(narration) > 60 else narration
+                    print(
+                        f"📢 [DEBUG] Sent narration to peer {peer_id}: '{display_text}'")
+
+                    # Update global last narration
+                    last_narration_per_client[peer_id] = narration
+            
         except Exception as e:
             print(f"⚠️ [ERROR] Frame processing error for peer {peer_id}: {e}")
             import traceback
             traceback.print_exc()
         finally:
-            print(f"🎥 [DEBUG] Batch inference completed, result: {'Success' if result else 'Skipped/None'}")
-        return result
+            print(f"🎥 [DEBUG] Batch inference completed, result: {'Success' if narration else 'Skipped/None'}")
+        return narration
 
 
 # ─── WebRTC signalling & media ingestion ───────────────────────────────
