@@ -305,7 +305,7 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
                   f"  - Similarity: {similarity:.2f}")
 
             # If the new narration is too similar, increment static counter
-            if similarity > SIMILARITY_THRESHOLD:
+            if similarity > TEXT_SIMILARITY_THRESHOLD:
                 static_response_count[sid] = static_response_count.get(sid, 0) + 1
                 print(f"⚠️ [DEBUG] Static response detected for peer {sid} (Count: {static_response_count[sid]})")
 
