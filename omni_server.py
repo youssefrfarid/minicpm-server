@@ -248,6 +248,30 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
     print(f"✅ [DEBUG] Got open narration channel for peer {sid}")
 
     try:
+        # Reset the session to start fresh
+        model.reset_session()
+        
+        # Create a system prompt for the assistant role
+        sys_prompt = {
+            "role": "system", 
+            "content": (
+                "You are an assistant for a visually impaired user. Your task is to summarize the scene from a real-time video stream in a single, brief sentence. "
+                "- Focus on the most important object or person. "
+                "- Do NOT list multiple items or describe them in detail. "
+                "- Example: 'You are looking at a person at a desk.' "
+                "- Example: 'There is a laptop on a table in front of you.'"
+            )
+        }
+        
+        # Prefill the system prompt
+        model.streaming_prefill(
+            session_id=GLOBAL_SESSION_ID,
+            msgs=[sys_prompt],
+            tokenizer=tokenizer,
+            omni_input=True,
+            max_slice_nums=1,
+            use_image_id=True
+        )
         # Prepare the multimodal prompt with the new frames
         prompt_text = "Briefly summarize the scene in one sentence."
 
