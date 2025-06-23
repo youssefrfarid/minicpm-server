@@ -103,13 +103,33 @@ def are_texts_similar(a: str, b: str) -> bool:
     return SequenceMatcher(None, a, b).ratio() > TEXT_SIMILARITY_THRESHOLD
 
 
-def get_peer_id_from_channel(channel: RTCDataChannel) -> str | None:
+def get_peer_id_from_channel(channel: RTCDataChannel) -> Optional[str]:
     """Extract peer ID from data channel by searching global state."""
-    for peer_id, channels in global_data_channels.items():
-        if channel.label in channels and channels[channel.label] == channel:
+    for peer_id, data in global_data_channels.items():
+        if data.get("control") == channel or data.get("narration") == channel:
             return peer_id
-    print("⚠️ [WARNING] Could not find peer_id for channel.")
     return None
+
+
+def cleanup_peer_data(peer_id: str):
+    """Clean up all data for a peer."""
+    print(f"🧹 Cleaning up data for peer {peer_id}")
+    if peer_id in peer_data:
+        # Cancel any running narration task
+        narration_task = peer_data[peer_id].get("narration_task")
+        if narration_task and not narration_task.done():
+            narration_task.cancel()
+        
+        # Remove all peer data
+        peer_data.pop(peer_id, None)
+    
+    # Clean up other global state
+    global_data_channels.pop(peer_id, None)
+    frame_counter.pop(peer_id, None)
+    last_fps_log_time.pop(peer_id, None)
+    last_narration_per_client.pop(peer_id, None)
+    
+    print(f"🧹 [DEBUG] Cleaned up all data for peer {peer_id}")
 
 
 async def narration_loop(peer_id: str):
@@ -134,24 +154,90 @@ async def narration_loop(peer_id: str):
         await asyncio.sleep(NARRATION_INTERVAL)
 
 
+def _process_frames_batch_sync(peer_id: str, frames: List[Image.Image]):
+    """Process a batch of frames with MiniCPM-o chat API. Runs in a separate thread."""
+    if not frames:
+        print("⚠️ [DEBUG] No frames provided to _process_frames_batch_sync")
+        return None
+
+    last_narration = last_narration_per_client.get(peer_id, "")
+    prompt_text = (
+        f"You are an assistant for a visually impaired user. "
+        "Your task is to summarize the scene from a real-time video stream in a single, brief sentence. "
+        "- Focus on the most important object or person. "
+        "- Do NOT list multiple items or describe them in detail."
+        f"Describe only what has changed since the previous description: '{last_narration}'. "
+        "One concise sentence."
+    )
+
+    # The user message is a combination of the prompt and the frames
+    msgs = [{'role': 'user', 'content': [prompt_text] + frames}]
+
+    try:
+        # Call the model's chat function
+        answer = model.chat(
+            msgs=msgs,
+            tokenizer=tokenizer,
+            temperature=0.1,
+        )
+
+        if not answer:
+            print("🗑️ [DEBUG] Empty response from model")
+            return None
+
+        # Clean up the response
+        clean_answer = answer.replace('<|tts_eos|>', '').strip()
+        if not clean_answer:
+            return None
+
+        # Compare with the last narration to filter static/repetitive responses
+        if are_texts_similar(clean_answer, last_narration):
+            print(f"🗑️ [DEBUG] Skipping similar narration for peer {peer_id}.")
+            return None
+
+        # Send the narration to the client
+        narration_channel = global_data_channels.get(peer_id, {}).get("narration")
+        if narration_channel and narration_channel.readyState == "open":
+            complete_message = {
+                "type": "narration",
+                "text": clean_answer
+            }
+            narration_channel.send(json.dumps(complete_message))
+            display_text = (clean_answer[:60] + '..') if len(clean_answer) > 60 else clean_answer
+            print(
+                f"📢 [DEBUG] Sent narration to peer {peer_id}: '{display_text}'")
+
+            # Update global last narration
+            last_narration_per_client[peer_id] = clean_answer
+            return clean_answer
+
+    except Exception as e:
+        print(f"⚠️ [ERROR] Frame processing error for peer {peer_id}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 async def process_frames_batch(peer_id: str, frames: List[Image.Image]):
     """Processes a batch of frames to generate narration."""
     if model_inference_lock.locked():
-        logger.warning(f"🚦 [WARN] Concurrency issue: process_frames_batch called while lock was already held. Aborting.")
+        print(f"🚦 [WARN] Concurrency issue: process_frames_batch called while lock was already held. Aborting.")
         return
 
     async with model_inference_lock:
-        logger.debug(f"🎥 [DEBUG] process_frames_batch called for peer {peer_id} with {len(frames)} frames")
+        print(f"🎥 [DEBUG] process_frames_batch called for peer {peer_id} with {len(frames)} frames")
         loop = asyncio.get_running_loop()
         result = None
         try:
             result = await loop.run_in_executor(
-                executor, _process_frames_batch_sync, peer_id, frames
+                None, _process_frames_batch_sync, peer_id, frames
             )
         except Exception as e:
-            logger.error(f"⚠️ [ERROR] Frame processing error for peer {peer_id}: {e}\n{traceback.format_exc()}")
+            print(f"⚠️ [ERROR] Frame processing error for peer {peer_id}: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
-            logger.debug(f"🎥 [DEBUG] Batch inference completed, result: {result}")
+            print(f"🎥 [DEBUG] Batch inference completed, result: {'Success' if result else 'Skipped/None'}")
         return result
 
 
@@ -247,9 +333,9 @@ async def offer(request: Request):
     offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
     pc = RTCPeerConnection()
+    pcs_data[pc.id] = {"pc": pc}
     peer_id = str(uuid.uuid4())
     pc.id = peer_id  # Assign the peer_id to the connection object
-    pcs[peer_id] = pc
 
     # Initialize data channels dictionary for this peer
     global_data_channels[peer_id] = {}
@@ -272,23 +358,28 @@ async def offer(request: Request):
         peer_id = pc.id
         print(f"📺 Video track received for peer {peer_id}")
 
-        # Initialize FPS counter and frame buffer
-        last_fps_log_time[peer_id] = time.time()
+        # Initialize peer-specific data
+        peer_data[peer_id] = {
+            "frame_buffer": [],
+            "narration_task": None,
+            "last_narration": "",
+            "static_response_counter": 0
+        }
         frame_counter[peer_id] = 0
-        frame_buffers[peer_id] = []
-        track_frame_counter = 0  # For skipping frames
+        last_fps_log_time[peer_id] = time.time()
+        last_narration_per_client[peer_id] = ""
 
         # Start the narration loop for this peer
-        if peer_id not in narration_loops:
+        if peer_id not in peer_data or peer_data[peer_id]["narration_task"] is None or peer_data[peer_id]["narration_task"].done():
             loop = asyncio.get_event_loop()
-            narration_loops[peer_id] = loop.create_task(
+            peer_data[peer_id]["narration_task"] = asyncio.create_task(
                 narration_loop(peer_id))
             print(f"✅ [DEBUG] Started narration loop for peer {peer_id}")
 
         try:
             while True:
                 # Gracefully exit if peer connection was closed
-                if peer_id not in pcs:
+                if peer_id not in pcs_data:
                     print(f"🛑 [DEBUG] Peer {peer_id} disconnected, stopping video processing.")
                     break
 
@@ -326,8 +417,8 @@ async def offer(request: Request):
 
                     # Add frame to buffer for streaming processing
                     # We'll maintain a sliding window in the narration_loop
-                    if peer_id in frame_buffers:
-                        frame_buffers[peer_id].append(pil_img)
+                    if peer_id in peer_data:
+                        peer_data[peer_id]["frame_buffer"].append(pil_img)
                         # We allow buffer to grow slightly beyond MAX_FRAMES_IN_BATCH
                         # narration_loop will trim it periodically
 
@@ -353,9 +444,9 @@ async def offer(request: Request):
         print(f"ℹ️ Connection state is {pc.connectionState}")
         if pc.connectionState in ("failed", "closed", "disconnected"):
             print(f"🔌 Peer {pc.id} disconnected.")
-            if pc.id in pcs:
-                await pcs[pc.id].close()
-                pcs.pop(pc.id, None)
+            if pc.id in pcs_data:
+                await pcs_data[pc.id]["pc"].close()
+                pcs_data.pop(pc.id, None)
                 cleanup_peer_data(pc.id)
 
     # Handle offer
