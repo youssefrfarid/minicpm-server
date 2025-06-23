@@ -176,22 +176,17 @@ async def initialize_streaming_session():
     
     print("🔄 [DEBUG] Initializing MiniCPM-o streaming session...")
     try:
-        # Reset the session to start fresh
+        # Reset the session and prefill the concise system prompt once
         model.reset_session()
-        
-        # Create a system prompt for the assistant role
         sys_prompt = {
-            "role": "system", 
+            "role": "system",
             "content": (
-                "You are an assistant for a visually impaired user. Your task is to summarize the scene from a real-time video stream in a single, brief sentence. "
+                "You are an assistant for a visually impaired user. "
+                "Your task is to summarize the scene from a real-time video stream in a single, brief sentence. "
                 "- Focus on the most important object or person. "
-                "- Do NOT list multiple items or describe them in detail. "
-                "- Example: 'You are looking at a person at a desk.' "
-                "- Example: 'There is a laptop on a table in front of you.'"
+                "- Do NOT list multiple items or describe them in detail."
             )
         }
-        
-        # Prefill the system prompt
         model.streaming_prefill(
             session_id=GLOBAL_SESSION_ID,
             msgs=[sys_prompt],
@@ -200,7 +195,7 @@ async def initialize_streaming_session():
             max_slice_nums=1,
             use_image_id=True
         )
-        
+
         model_initialized = True
         print("✅ [DEBUG] MiniCPM-o streaming session initialized")
         return True
@@ -248,35 +243,14 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
     print(f"✅ [DEBUG] Got open narration channel for peer {sid}")
 
     try:
-        # Reset the session to start fresh
-        model.reset_session()
         
-        # Create a system prompt for the assistant role
-        sys_prompt = {
-            "role": "system", 
-            "content": (
-                "You are an assistant for a visually impaired user. Your task is to summarize the scene from a real-time video stream in a single, brief sentence. "
-                "- Focus on the most important object or person. "
-                "- Do NOT list multiple items or describe them in detail. "
-                "- Example: 'You are looking at a person at a desk.' "
-                "- Example: 'There is a laptop on a table in front of you.'"
-            )
-        }
-        
-        # Prefill the system prompt
-        model.streaming_prefill(
-            session_id=GLOBAL_SESSION_ID,
-            msgs=[sys_prompt],
-            tokenizer=tokenizer,
-            omni_input=True,
-            max_slice_nums=1,
-            use_image_id=True
+        # Prepare the multimodal prompt focusing on changes since the last narration
+        prompt_text = (
+            f"Describe only what has changed since the previous description: '{last_narration}'. "
+            "One concise sentence."
         )
-        # Prepare the multimodal prompt with the new frames
-        prompt_text = "Briefly summarize the scene in one sentence."
 
-        # The documentation suggests creating a flattened list of the prompt, 
-        # special <unit> tokens, and image objects.
+        # Build the flattened content list per MiniCPM-o multimodal format
         content_list = [prompt_text]
         for frame in frames:
             content_list.append("<unit>")
