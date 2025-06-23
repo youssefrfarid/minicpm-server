@@ -333,9 +333,9 @@ async def offer(request: Request):
     offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
     pc = RTCPeerConnection()
-    pcs_data[pc.id] = {"pc": pc}
     peer_id = str(uuid.uuid4())
     pc.id = peer_id  # Assign the peer_id to the connection object
+    pcs_data[pc.id] = {"pc": pc}  # Now we can safely use pc.id
 
     # Initialize data channels dictionary for this peer
     global_data_channels[peer_id] = {}
