@@ -133,6 +133,11 @@ def _process_frames_batch_sync(peer_id: str, frames: List[Image.Image]):
     if not frames:
         print("⚠️ [DEBUG] No frames provided to _process_frames_batch_sync")
         return None
+    
+    # Limit the number of frames to MAX_FRAMES_IN_BATCH
+    if len(frames) > MAX_FRAMES_IN_BATCH:
+        print(f"📅 [DEBUG] Limiting batch from {len(frames)} to {MAX_FRAMES_IN_BATCH} frames")
+        frames = frames[-MAX_FRAMES_IN_BATCH:]  # Take the most recent frames
 
     last_narration = last_narration_per_client.get(peer_id, "")
     prompt_text = (
