@@ -192,7 +192,7 @@ async def initialize_streaming_session():
                 "Describe what they are looking at in 1-2 SHORT sentences using conversational language. "
                 "Focus ONLY on main objects or people in front of the camera. Be brief and direct. "
                 "Use phrases like 'You are looking at...', 'There is... in front of you'. "
-                "Examples: 'You are looking at a laptop.' or 'There is a person typing in front of you.'"
+                "Examples: 'You are looking at a laptop.' or 'There is a person waving at you.'"
             )
         }
         
@@ -295,52 +295,45 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
         if not clean_answer:
             return None
 
-        # Filter out unwanted static phrases
-        static_phrases = ["static", "unchanged", "similar to before", "remains the same",
-                            "no change", "no movement", "no new", "no different"]
-        
-        # Check if the response is static
-        is_static = any(phrase in clean_answer.lower() for phrase in static_phrases)
-        
-        if is_static:
-            # Increment the static response counter for this peer
-            static_response_count[sid] = static_response_count.get(sid, 0) + 1
-            print(f"🗑️ [DEBUG] Discarding static response for peer {sid} (count: {static_response_count[sid]}): '{clean_answer}'")
-            
-            # Check if we've had too many static responses in a row
-            if static_response_count[sid] >= MAX_STATIC_RESPONSES:
-                print(f"⚠️ [WARNING] Too many static responses for peer {sid}, resetting streaming session")
-                # Reset the session
-                try:
-                    model_initialized = False  # Force re-initialization
-                    model.reset_session()  # Clean slate
-                    await initialize_streaming_session()  # Re-initialize with system prompt
-                    
-                    # Clear part of the frame buffer to get fresh frames
-                    if sid in frame_buffers and len(frame_buffers[sid]) > 0:
-                        # Keep only the most recent frames
-                        frames_to_keep = min(5, len(frame_buffers[sid]))
-                        frame_buffers[sid] = frame_buffers[sid][-frames_to_keep:]
-                        print(f"🔄 [DEBUG] Frame buffer partially cleared for peer {sid}, keeping {frames_to_keep} frames")
-                    
-                    # Reset the static response counter
-                    static_response_count[sid] = 0
-                except Exception as e:
-                    print(f"❌ [ERROR] Failed to reset session: {str(e)}")
-            
-            return None
-
-        # Filter out responses that are too similar to the last one
+        # Compare with the last narration to filter static/repetitive responses
+        last_narration = last_narration_per_client.get(sid, "")
         if last_narration:
             similarity = fuzz.ratio(clean_answer.lower(), last_narration.lower()) / 100.0
-            if similarity > TEXT_SIMILARITY_THRESHOLD:
-                no_change_count[sid] = no_change_count.get(sid, 0) + 1
-                if no_change_count[sid] >= 2:
-                    print(
-                        f"🗑️ [DEBUG] Discarding highly similar response for peer {sid} (sim: {similarity:.2f}): '{clean_answer}'")
+            print(f"🔎 [SIMILARITY] Comparing:\n"
+                  f"  - New: '{clean_answer}'\n"
+                  f"  - Last: '{last_narration}'\n"
+                  f"  - Similarity: {similarity:.2f}")
+
+            # If the new narration is too similar, increment static counter
+            if similarity > SIMILARITY_THRESHOLD:
+                static_response_count[sid] = static_response_count.get(sid, 0) + 1
+                print(f"⚠️ [DEBUG] Static response detected for peer {sid} (Count: {static_response_count[sid]})")
+
+                # Check if we've had too many static responses in a row
+                if static_response_count[sid] >= MAX_STATIC_RESPONSES:
+                    print(f"⚠️ [WARNING] Too many static responses for peer {sid}, resetting streaming session")
+                    try:
+                        model_initialized = False
+                        model.reset_session()
+                        await initialize_streaming_session()
+                        
+                        if sid in frame_buffers and len(frame_buffers[sid]) > 0:
+                            frames_to_keep = min(5, len(frame_buffers[sid]))
+                            frame_buffers[sid] = frame_buffers[sid][-frames_to_keep:]
+                            print(f"🔄 [DEBUG] Frame buffer partially cleared for peer {sid}, keeping {frames_to_keep} frames")
+                        
+                        static_response_count[sid] = 0
+                    except Exception as e:
+                        print(f"❌ [ERROR] Failed to reset session: {str(e)}")
+                    return None # Stop processing this response after reset
+
+                # Also skip sending the message if it's almost identical to prevent spam
+                if similarity > TEXT_SIMILARITY_THRESHOLD: 
+                    print(f"🗑️ [DEBUG] Skipping identical narration for peer {sid}.")
                     return None
             else:
-                no_change_count[sid] = 0
+                # Reset counter if response is different enough
+                static_response_count[sid] = 0
 
         # Send the narration to the client
         if narration_channel and narration_channel.readyState == "open":
@@ -525,6 +518,11 @@ async def offer(request: Request):
 
         try:
             while True:
+                # Gracefully exit if peer connection was closed
+                if peer_id not in pcs:
+                    print(f"🛑 [DEBUG] Peer {peer_id} disconnected, stopping video processing.")
+                    break
+
                 try:
                     # Get next video frame
                     frame = await track.recv()
