@@ -277,7 +277,11 @@ async def _process_frame_sync(sid: str, frames: List[Image.Image]):
         # Process the streaming response
         complete_response = ""
         for new_text in response_iterator:
-            complete_response += new_text
+            if isinstance(new_text, dict):
+                text_chunk = new_text.get('text', '')
+                complete_response += text_chunk
+            else:
+                complete_response += new_text
 
         if not complete_response:
             print("🗑️ [DEBUG] Empty response from model")
