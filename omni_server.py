@@ -1,29 +1,3 @@
-"""Pure WebRTC ASGI server for LumiMate live narration.
-
-This server uses FastAPI for WebRTC signalling (SDP offer/answer)
-and aiortc for handling WebRTC peer connections and data channels.
-Narration tokens are streamed over a WebRTC data channel.
-
-Run with:
-    uvicorn lib.services.omni_server:app --host 0.0.0.0 --port 8123 --reload
-
-Endpoints:
-    POST /offer       – WebRTC signalling (SDP offer → answer)
-
-Data Channels:
-    'narration'       – For sending narration tokens from server to client.
-    'control'         – For control messages (e.g., start/stop narration) from client to server.
-
-Media (UDP) ports are negotiated via ICE; ensure relevant UDP ports are open if behind NAT/firewall.
-
-Dependencies (pip install):
-    fastapi uvicorn[standard] aiortc opencv-python Pillow
-
-Notes:
-- MiniCPM-o model is loaded once and shared.
-- Heavy model calls run in a background thread via asyncio.to_thread.
-- Video is received via WebRTC, processed, and narration is sent back.
-"""
 from __future__ import annotations
 import asyncio
 import logging
@@ -136,7 +110,7 @@ async def narration_loop(peer_id: str):
     """Periodically processes frames from the buffer for narration."""
     while peer_id in pcs_data and not peer_data[peer_id]["narration_task"].cancelled():
         if model_inference_lock.locked():
-            logger.debug(f"🔄 [NARRATION_LOOP] Skipping batch for peer {peer_id}, as model is busy.")
+            print(f"🔄 [NARRATION_LOOP] Skipping batch for peer {peer_id}, as model is busy.")
             await asyncio.sleep(NARRATION_INTERVAL)
             continue
 
@@ -148,7 +122,7 @@ async def narration_loop(peer_id: str):
             peer_data[peer_id]["frame_buffer"].clear()
 
         if frames_to_process:
-            logger.info(f"🔄 [NARRATION_LOOP] Processing a batch of {len(frames_to_process)} frames for peer {peer_id}")
+            print(f"🔄 [NARRATION_LOOP] Processing a batch of {len(frames_to_process)} frames for peer {peer_id}")
             asyncio.create_task(process_frames_batch(peer_id, frames_to_process))
         
         await asyncio.sleep(NARRATION_INTERVAL)
@@ -257,20 +231,17 @@ async def handle_start_narration(channel: RTCDataChannel, data: Dict[str, Any]):
 
         client_id = data.get('client_id', 'unknown')
 
-        logger.info(
-            f"🎬 [DEBUG] Starting narration for peer {peer_id}, client {client_id}")
+        print(f"🎬 [DEBUG] Starting narration for peer {peer_id}, client {client_id}")
         
         # Initialize streaming session if needed
-        if not model_initialized:
-            init_success = await initialize_streaming_session()
-            if not init_success:
-                logger.error("❌ [ERROR] Failed to initialize streaming session")
-                print("❌ [ERROR] Failed to initialize streaming session")
-                channel.send(json.dumps({
-                    "type": "error",
-                    "message": "Failed to initialize model"
-                }))
-                return
+        # We don't need to initialize streaming session anymore with batch processing
+        if False:  # This block is disabled, but kept for reference
+            print("✅ [DEBUG] Model streaming initialization is not needed with batch processing")
+            channel.send(json.dumps({
+                "type": "error",
+                "message": "Failed to initialize model"
+            }))
+            return
 
         # Send acknowledgment
         response = {
